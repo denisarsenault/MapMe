@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>MapMe</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>CKSharingSupported</key>
+	<true/>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>MapMe needs background access so periodic location samples can be recorded while the watch is on your wrist and the app is closed.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>MapMe records your watch's location to map your real-time position and build a 24-hour history.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>location</string>
+		<!--
+			Required by NSPersistentCloudKitContainer on watchOS — without
+			`remote-notification`, CKContainer logs "BUG IN CLIENT OF
+			CLOUDKIT: CloudKit push notifications require the
+			'remote-notification' background mode in your info plist" and
+			downstream silent pushes (consent flips, fresh fixes from
+			paired devices) don't wake the watch app. Same fix we already
+			applied to the iOS plist.
+		-->
+		<string>remote-notification</string>
+	</array>
+	<key>WKApplication</key>
+	<true/>
+	<key>WKBackgroundModes</key>
+	<array>
+		<string>location</string>
+		<!--
+			watchOS reads `WKBackgroundModes` for the watchOS-native
+			modes; mirror the `remote-notification` so the CloudKit
+			subsystem stops complaining and silent pushes can wake the
+			extended runtime path.
+		-->
+		<string>remote-notification</string>
+	</array>
+	<key>WKCompanionAppBundleIdentifier</key>
+	<string>$(IOS_APP_BUNDLE_ID)</string>
+	<key>WKRunsIndependentlyOfCompanionApp</key>
+	<true/>
+	<key>WKSupportsLocationTracking</key>
+	<true/>
+	<key>WKWatchOnly</key>
+	<false/>
+</dict>
+</plist>

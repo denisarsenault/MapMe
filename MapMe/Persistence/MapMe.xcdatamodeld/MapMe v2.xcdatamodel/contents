@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<model type="com.apple.IDECoreDataModeler.DataModel" documentVersion="1.0" lastSavedToolsVersion="22222" systemVersion="23A344" minimumToolsVersion="Automatic" sourceLanguage="Swift" usedWithCloudKit="YES" userDefinedModelVersionIdentifier="2">
+    <entity name="MinorProfile" representedClassName="MinorProfile" syncable="YES" codeGenerationType="class">
+        <attribute name="consentGrantedAt" optional="YES" attributeType="Date" usesScalarValueType="NO"/>
+        <attribute name="createdAt" optional="YES" attributeType="Date" usesScalarValueType="NO"/>
+        <attribute name="deviceIdentifier" optional="YES" attributeType="String" allowsCloudEncryption="YES"/>
+        <attribute name="displayName" optional="YES" attributeType="String" allowsCloudEncryption="YES"/>
+        <attribute name="id" optional="YES" attributeType="UUID" usesScalarValueType="NO"/>
+        <relationship name="archives" optional="YES" toMany="YES" deletionRule="Cascade" destinationEntity="DayArchive" inverseName="profile" inverseEntity="DayArchive"/>
+        <relationship name="records" optional="YES" toMany="YES" deletionRule="Cascade" destinationEntity="LocationRecord" inverseName="profile" inverseEntity="LocationRecord"/>
+    </entity>
+    <entity name="LocationRecord" representedClassName="LocationRecord" syncable="YES" codeGenerationType="class">
+        <attribute name="altitude" optional="YES" attributeType="Double" defaultValueString="0.0" usesScalarValueType="YES" allowsCloudEncryption="YES"/>
+        <attribute name="course" optional="YES" attributeType="Double" defaultValueString="-1.0" usesScalarValueType="YES" allowsCloudEncryption="YES"/>
+        <attribute name="deviceIdentifier" optional="YES" attributeType="String" allowsCloudEncryption="YES"/>
+        <attribute name="deviceName" optional="YES" attributeType="String" allowsCloudEncryption="YES"/>
+        <attribute name="horizontalAccuracy" optional="YES" attributeType="Double" defaultValueString="0.0" usesScalarValueType="YES" allowsCloudEncryption="YES"/>
+        <attribute name="id" optional="YES" attributeType="UUID" usesScalarValueType="NO"/>
+        <attribute name="latitude" optional="YES" attributeType="Double" defaultValueString="0.0" usesScalarValueType="YES" allowsCloudEncryption="YES"/>
+        <attribute name="longitude" optional="YES" attributeType="Double" defaultValueString="0.0" usesScalarValueType="YES" allowsCloudEncryption="YES"/>
+        <attribute name="speed" optional="YES" attributeType="Double" defaultValueString="-1.0" usesScalarValueType="YES" allowsCloudEncryption="YES"/>
+        <attribute name="timestamp" optional="YES" attributeType="Date" usesScalarValueType="NO"/>
+        <attribute name="verticalAccuracy" optional="YES" attributeType="Double" defaultValueString="0.0" usesScalarValueType="YES" allowsCloudEncryption="YES"/>
+        <relationship name="archive" optional="YES" maxCount="1" deletionRule="Nullify" destinationEntity="DayArchive" inverseName="records" inverseEntity="DayArchive"/>
+        <relationship name="profile" optional="YES" maxCount="1" deletionRule="Nullify" destinationEntity="MinorProfile" inverseName="records" inverseEntity="MinorProfile"/>
+    </entity>
+    <entity name="DayArchive" representedClassName="DayArchive" syncable="YES" codeGenerationType="class">
+        <attribute name="date" optional="YES" attributeType="Date" usesScalarValueType="NO"/>
+        <attribute name="distanceMeters" optional="YES" attributeType="Double" defaultValueString="0.0" usesScalarValueType="YES" allowsCloudEncryption="YES"/>
+        <attribute name="id" optional="YES" attributeType="UUID" usesScalarValueType="NO"/>
+        <attribute name="maxLatitude" optional="YES" attributeType="Double" defaultValueString="0.0" usesScalarValueType="YES" allowsCloudEncryption="YES"/>
+        <attribute name="maxLongitude" optional="YES" attributeType="Double" defaultValueString="0.0" usesScalarValueType="YES" allowsCloudEncryption="YES"/>
+        <attribute name="minLatitude" optional="YES" attributeType="Double" defaultValueString="0.0" usesScalarValueType="YES" allowsCloudEncryption="YES"/>
+        <attribute name="minLongitude" optional="YES" attributeType="Double" defaultValueString="0.0" usesScalarValueType="YES" allowsCloudEncryption="YES"/>
+        <attribute name="recordCount" optional="YES" attributeType="Integer 32" defaultValueString="0" usesScalarValueType="YES"/>
+        <relationship name="profile" optional="YES" maxCount="1" deletionRule="Nullify" destinationEntity="MinorProfile" inverseName="archives" inverseEntity="MinorProfile"/>
+        <relationship name="records" optional="YES" toMany="YES" deletionRule="Cascade" destinationEntity="LocationRecord" inverseName="archive" inverseEntity="LocationRecord"/>
+    </entity>
+</model>
