@@ -9,11 +9,24 @@ struct WatchLockView: View {
 
     var body: some View {
         ScrollView {
-            VStack(spacing: 8) {
+            VStack(spacing: 4) {
+                // Brand wordmark at the top. Sized small enough that a
+                // 38/40/41 mm watch face still fits the lock icon,
+                // headline, PIN entry, and Unlock button in one visual
+                // unit without the user having to scroll to find the
+                // PIN. 88 pt is the empirical "still legible at 1 ft
+                // viewing distance, doesn't dominate" floor on a 38 mm
+                // Series 3 face.
+                Image("MMLogo")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 88)
+                    .accessibilityLabel("MapMe")
                 Image(systemName: "lock.fill")
-                    .font(.title3)
+                    .font(.caption)
                     .foregroundStyle(.tint)
-                Text("MapMe locked").font(.headline)
+                Text("MapMe locked")
+                    .font(.subheadline.weight(.semibold))
 
                 if isCheckingPhone {
                     ProgressView("Asking iPhone…")
@@ -24,6 +37,8 @@ struct WatchLockView: View {
 
                 Button("Unlock", action: submit)
                     .buttonStyle(.borderedProminent)
+                    .font(.caption)
+                    .controlSize(.small)
 
                 if connectivity.isReachable {
                     Button {
@@ -33,13 +48,14 @@ struct WatchLockView: View {
                     }
                     .font(.caption2)
                     .buttonStyle(.bordered)
+                    .controlSize(.small)
                 }
 
                 if let error {
                     Text(error).font(.caption2).foregroundStyle(.red)
                 }
             }
-            .padding(.vertical, 4)
+            .padding(.vertical, 2)
         }
     }
 

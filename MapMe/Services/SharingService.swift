@@ -101,7 +101,20 @@ final class SharingService: ObservableObject {
     func makeShare(for profile: MinorProfile) async throws -> (CKShare, CKContainer) {
         let (_, share, ckContainer) = try await persistence.container.share([profile], to: nil)
         share[CKShare.SystemFieldKey.title] = "MapMe – \(profile.displayName ?? "Minor")" as CKRecordValue
-        share.publicPermission = .none
+        // `.readWrite`, not `.none`. The Guardian must be able to write
+        // `consentGrantedAt` back into this shared profile — that's the whole
+        // point of the consent gate. Most invites are delivered as a raw
+        // CKShare URL (macOS link, watch → iPhone share sheet), and a link
+        // recipient only inherits the share's *public* permission: with
+        // `.none` they join read-only (or can't join), which silently breaks
+        // "Grant consent" on the Guardian side. The invite URL itself is the
+        // secret here — it's sent privately over Messages/Mail/AirDrop — so
+        // link-based read-write is the intended model. The iOS
+        // `UICloudSharingController` path additionally pins per-participant
+        // read-write by omitting `.allowReadOnly` from its available
+        // permissions (see `CloudShareSheet`), so no send path can produce a
+        // read-only Guardian.
+        share.publicPermission = .readWrite
         return (share, ckContainer)
     }
 
@@ -176,11 +189,31 @@ final class SharingService: ObservableObject {
     // MARK: - Share acceptance (Guardian)
 
     /// Called from the `UIApplicationDelegate` /
-    /// `NSApplicationDelegate` callback when iOS hands us a share invitation.
+    /// `NSApplicationDelegate` callback when iOS hands us a share
+    /// invitation.
+    ///
+    /// Cold-launch races used to crash here — iOS calls
+    /// `userDidAcceptCloudKitShareWith:` the moment the app starts
+    /// (before `loadPersistentStores` has called its callback), so
+    /// `persistence.sharedStore` was nil and the force-unwrap
+    /// terminated the app silently. From the Guardian's perspective,
+    /// tapping the invite link did nothing. We now `await` the
+    /// shared store to become available before importing, and throw
+    /// a descriptive error if the wait times out so the caller can
+    /// surface it instead of swallowing.
     func acceptShare(metadata: CKShare.Metadata) async throws {
+        let ready = await persistence.waitForSharedStore()
+        guard ready, let sharedStore = persistence.sharedStore else {
+            throw NSError(
+                domain: "MapMe.Sharing",
+                code: 200,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "MapMe's shared CloudKit store didn't finish loading in time. Reopen MapMe and tap the invite link again."]
+            )
+        }
         try await persistence.container.acceptShareInvitations(
             from: [metadata],
-            into: persistence.sharedStore!
+            into: sharedStore
         )
     }
 }

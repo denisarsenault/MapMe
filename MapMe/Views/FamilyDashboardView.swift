@@ -54,29 +54,13 @@ struct FamilyDashboardView: View {
                 }
             }
             .navigationTitle("Family")
-            .toolbar {
-                // Brand mark in the navigation bar so the user always
-                // has a visible cue that they're in MapMe — useful for
-                // screenshots / multitasking when the app icon isn't
-                // visible. We use MMBrandMark (square pin-only) here,
-                // not the wordmark MMLogo, because a wordmark shrunk
-                // into a 40-pt square becomes unreadable. 40 pt lets
-                // the pin read clearly without crowding the nav title.
-                ToolbarItem(placement: .principal) {
-                    HStack(spacing: 8) {
-                        Image("MMBrandMark")
-                            .resizable()
-                            .scaledToFit()
-                            .frame(width: 40, height: 40)
-                        Text("MapMe")
-                            .font(.headline)
-                    }
-                }
-            }
+            .mapMeBrandToolbar()
             .navigationDestination(for: NSManagedObjectID.self) { id in
                 MinorDetailView(profileID: id)
             }
-            .task { await guardianSync.ensureSubscription() }
+            .task {
+                await guardianSync.ensureSubscription()
+            }
             .refreshable {
                 // Pull-to-refresh re-asks the system to fetch from the shared DB.
                 await guardianSync.ensureSubscription()
@@ -182,15 +166,57 @@ struct FamilyDashboardView: View {
 struct MinorDetailView: View {
     let profileID: NSManagedObjectID
     @Environment(\.managedObjectContext) private var ctx
+
+    var body: some View {
+        // Resolve the row once, then hand it to a child view that holds it as
+        // an @ObservedObject. Observing the profile is what makes the consent
+        // toggle (and any synced change) re-render this screen — without it,
+        // tapping "Grant consent" mutated + saved the object but SwiftUI had
+        // no dependency on it, so the button appeared to do nothing.
+        if let profile = try? ctx.existingObject(with: profileID) as? MinorProfile {
+            MinorDetailContent(profile: profile)
+        } else {
+            ContentUnavailableView("Profile missing", systemImage: "exclamationmark.triangle")
+        }
+    }
+}
+
+private struct MinorDetailContent: View {
+    @ObservedObject var profile: MinorProfile
+    @State private var consentError: String?
+    @State private var nicknameDraft: String = ""
     #if os(iOS) || os(macOS)
     @ObservedObject private var snapService = SnapToRoadsService.shared
     #endif
 
     var body: some View {
-        if let profile = try? ctx.existingObject(with: profileID) as? MinorProfile {
-            content(for: profile)
-        } else {
-            ContentUnavailableView("Profile missing", systemImage: "exclamationmark.triangle")
+        content(for: profile)
+            .alert(
+                "Couldn't update consent",
+                isPresented: Binding(
+                    get: { consentError != nil },
+                    set: { if !$0 { consentError = nil } }
+                ),
+                presenting: consentError
+            ) { _ in
+                Button("OK", role: .cancel) { consentError = nil }
+            } message: { msg in
+                Text(msg)
+            }
+    }
+
+    /// Writes the new consent timestamp and surfaces any save failure instead
+    /// of swallowing it — a save to the shared (Guardian-side) profile can
+    /// fail for real reasons (e.g. the CKShare granted only read access, or
+    /// the shared zone hasn't finished its first sync on a freshly paired
+    /// device), and the user needs to see that rather than a dead button.
+    private func setConsent(_ date: Date?) {
+        profile.consentGrantedAt = date
+        do {
+            try profile.managedObjectContext?.save()
+        } catch {
+            profile.managedObjectContext?.rollback()
+            consentError = error.localizedDescription
         }
     }
 
@@ -210,6 +236,8 @@ struct MinorDetailView: View {
                 } footer: {
                     Text("Tracking on this minor's device is gated by your approval. You can revoke at any time and tracking stops on the next sync.")
                 }
+
+                nicknameSection(for: profile)
 
                 Section("Recent points") {
                     ForEach(records.suffix(50).reversed(), id: \.objectID) { r in
@@ -264,6 +292,41 @@ struct MinorDetailView: View {
         #endif
     }
 
+    /// Local-only "spoken name" override. Editable on this Guardian
+    /// device; falls back to `displayName` if the field is left blank.
+    /// See `GuardianAudioAlertService` for the persistence + speech
+    /// pipeline. Seeds the draft from stored state on appearance and
+    /// commits it on `.onSubmit` / focus loss.
+    @ViewBuilder
+    private func nicknameSection(for profile: MinorProfile) -> some View {
+        Section {
+            TextField(
+                profile.displayName ?? "Nickname",
+                text: $nicknameDraft
+            )
+            #if os(iOS)
+            .textInputAutocapitalization(.words)
+            .autocorrectionDisabled(true)
+            #endif
+            .onSubmit {
+                GuardianAudioAlertService.shared.setNickname(nicknameDraft,
+                                                             for: profile)
+            }
+            .onAppear {
+                nicknameDraft = GuardianAudioAlertService.shared
+                    .nickname(for: profile)
+            }
+            .onChange(of: nicknameDraft) { _, newValue in
+                GuardianAudioAlertService.shared.setNickname(newValue,
+                                                             for: profile)
+            }
+        } header: {
+            Text("Spoken nickname")
+        } footer: {
+            Text("Used by MapMe's audio alerts when this device starts moving — e.g. \"Alice is on the move.\" Local to this device; other Guardian devices set their own.")
+        }
+    }
+
     @ViewBuilder
     private func consentRow(_ profile: MinorProfile) -> some View {
         if let granted = profile.consentGrantedAt {
@@ -274,8 +337,7 @@ struct MinorDetailView: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                 Button("Revoke consent", role: .destructive) {
-                    profile.consentGrantedAt = nil
-                    try? profile.managedObjectContext?.save()
+                    setConsent(nil)
                 }
             }
         } else {
@@ -286,8 +348,7 @@ struct MinorDetailView: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                 Button("Grant consent") {
-                    profile.consentGrantedAt = Date()
-                    try? profile.managedObjectContext?.save()
+                    setConsent(Date())
                 }
                 .buttonStyle(.borderedProminent)
             }
@@ -332,7 +393,12 @@ struct MinorDetailView: View {
                     ForEach(trips) { trip in
                         if trip.coordinates.count > 1 {
                             MapPolyline(coordinates: trip.coordinates)
-                                .stroke(.tint, lineWidth: 4)
+                                .stroke(
+                                    trip.isFallback ? AnyShapeStyle(Color.accentColor.opacity(0.55)) : AnyShapeStyle(.tint),
+                                    style: trip.isFallback
+                                        ? StrokeStyle(lineWidth: 3, dash: [10, 6])
+                                        : StrokeStyle(lineWidth: 4)
+                                )
                         }
                     }
                 }
@@ -356,6 +422,25 @@ struct MinorDetailView: View {
                         .padding(.vertical, 6)
                         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
                         .padding(12)
+                    }
+                }
+                .overlay(alignment: .bottomLeading) {
+                    // Distinguish a rate-limited render (some solid segments
+                    // are raw GPS, not road-matched — they'll snap on a later
+                    // view) from a genuine data gap (dashed). Hidden while a
+                    // snap is actively in flight so it doesn't fight the
+                    // progress badge.
+                    if snapService.isEnabled,
+                       snapService.hasThrottledResults,
+                       !snapService.isWorking {
+                        Label("Snapping rate-limited — some segments shown as raw GPS",
+                              systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.orange)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+                            .padding(12)
                     }
                 }
             } else {

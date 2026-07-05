@@ -2,6 +2,7 @@ import SwiftUI
 import CoreData
 import CloudKit
 import WatchKit
+import WidgetKit
 
 struct WatchSettingsView: View {
     @EnvironmentObject private var auth: AuthService
@@ -10,9 +11,6 @@ struct WatchSettingsView: View {
 
     @StateObject private var sharing = SharingService()
     @ObservedObject private var snapService = SnapToRoadsService.shared
-    /// Speed-driven sampling knobs for *this watch*. UserDefaults-backed
-    /// singleton — slider drags take effect on the very next CL fix.
-    @ObservedObject private var adaptive = AdaptiveSamplingConfig.shared
 
     // Filter to *this watch's* MinorProfile only. Without this, CloudKit
     // sync of the paired iPhone's profile lands in our private store too,
@@ -28,8 +26,41 @@ struct WatchSettingsView: View {
     @State private var isGenerating = false
     @State private var isSendingViaPhone = false
 
+    /// `true` once we've confirmed no MapMe complication is on the active
+    /// watch face. Drives the recovery nudge — without a complication,
+    /// watchOS won't background-launch MapMe after the watch is recharged /
+    /// restarted, so background tracking silently stops until the app is
+    /// opened by hand. Starts `false` so the nudge never flashes before the
+    /// async check completes (and stays hidden if the check fails).
+    @State private var complicationMissing = false
+
+    /// Inline status under the "Test alert" button — populated with
+    /// "Sent…" on success or the failure reason ("Notifications are
+    /// off in Settings → MapMe → Notifications.") on denial, so a
+    /// dropped permission isn't misread as a broken feature.
+    @State private var pauseAlertTestStatus: String?
+
+    /// Kind of the watch complication (`MapMeStatusWidget.kind`). The widget
+    /// lives in a separate extension target, so we match by literal — the
+    /// same identifier the app already uses for `reloadTimelines(ofKind:)`.
+    private static let complicationKind = "com.mapme.app.status"
+
     var body: some View {
+        // NavigationStack is required for the `NavigationLink` into
+        // `WatchAdaptiveSamplingView`. Previously the body was a bare
+        // `List` and `.navigationTitle("Settings")` was decoration —
+        // wrapping it in `NavigationStack` makes the title bar real
+        // and the push transition work.
+        NavigationStack {
+            settingsList
+                .navigationTitle("Settings")
+        }
+    }
+
+    private var settingsList: some View {
         List {
+            complicationNudgeSection
+
             Section {
                 Label("Tracked device", systemImage: "location")
                     .font(.caption)
@@ -41,6 +72,22 @@ struct WatchSettingsView: View {
             }
 
             guardianSection
+
+            Section {
+                Toggle(isOn: $location.autoStartOnMotion) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Auto-start on motion").font(.caption)
+                        Text("Starts Live tracking automatically when the watch detects you've started walking, running, cycling, or driving. Stops it again after five minutes of stillness.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            } header: {
+                Text("Motion")
+            } footer: {
+                Text("Requires Motion & Fitness permission. Turn off if you'd rather start and stop Live yourself.")
+                    .font(.caption2)
+            }
 
             Section("Tracking") {
                 Text("Auth: \(authText)")
@@ -77,7 +124,20 @@ struct WatchSettingsView: View {
                     .font(.caption2)
             }
 
-            adaptiveSamplingSection
+            Section {
+                NavigationLink {
+                    WatchAdaptiveSamplingView()
+                } label: {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Adaptive sampling").font(.caption)
+                        Text("Cadence varies by motion speed.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            } header: {
+                Text("Sampling")
+            }
 
             Section {
                 Toggle(isOn: $snapService.isEnabled) {
@@ -90,6 +150,46 @@ struct WatchSettingsView: View {
                 }
             } header: {
                 Text("Map")
+            }
+
+            Section {
+                Toggle(isOn: $location.pauseAlertEnabled) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Alert if tracking pauses").font(.caption)
+                        Text("Notifies you to reopen MapMe if no location is recorded for ~30 minutes — e.g. after the watch runs out of power and is recharged.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                // Lets a user verify the notification permission + delivery
+                // chain works *now*, instead of waiting two hours for the
+                // real watchdog to fire. Surfaces the failure reason inline
+                // (e.g. "Notifications are off in Settings → MapMe") so a
+                // silently-denied permission isn't misread as a broken feature.
+                Button {
+                    pauseAlertTestStatus = "Sending…"
+                    location.fireTestPauseAlert { delivered, reason in
+                        DispatchQueue.main.async {
+                            pauseAlertTestStatus = delivered
+                                ? "Sent — check your wrist for the notification."
+                                : (reason ?? "Couldn't deliver test alert.")
+                        }
+                    }
+                } label: {
+                    Label("Test alert", systemImage: "bell.badge")
+                        .font(.caption)
+                }
+                if let pauseAlertTestStatus {
+                    Text(pauseAlertTestStatus)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Alerts")
+            } footer: {
+                Text("A watch left on the charger off your wrist can also pause tracking, so this may occasionally alert when you don't expect it.")
+                    .font(.caption2)
             }
 
             Section("Lock") {
@@ -107,147 +207,56 @@ struct WatchSettingsView: View {
             }
         }
         .navigationTitle("Settings")
+        // Re-check on every appearance so the nudge clears as soon as the
+        // user comes back from adding the complication to their face.
+        .onAppear { checkComplicationStatus() }
     }
 
-    // MARK: - Adaptive sampling section
+    // MARK: - Complication nudge
 
-    /// Compact speed-band sliders for the watch. Each slider's value reads
-    /// and writes through `AdaptiveSamplingConfig.shared`'s `@Published`
-    /// vars, which persist to UserDefaults on every change. The watch and
-    /// the iPhone keep independent settings, so dialing the watch into a
-    /// car-friendly "Vehicle every 15 s" doesn't change the iPhone's
-    /// cadence (which often sits in the user's pocket and should write less).
     @ViewBuilder
-    private var adaptiveSamplingSection: some View {
-        Section {
-            Toggle(isOn: $adaptive.isEnabled) {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Adaptive").font(.caption)
-                    Text("Cadence varies by motion speed.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
+    private var complicationNudgeSection: some View {
+        if complicationMissing {
+            Section {
+                Label("Add a watch face complication", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.orange)
+                Text("If your watch loses power, MapMe can't resume background tracking on its own after recharging. Adding a MapMe complication to your watch face lets the system relaunch it automatically.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text("Touch and hold the watch face → Edit → Complications → pick MapMe.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } header: {
+                Text("Background tracking")
             }
+        }
+    }
 
-            if adaptive.isEnabled {
-                // Live diagnostic up top so the user can watch which band
-                // they're in while dragging sliders below.
-                let speedKmh = max(0, location.lastLocation?.speed ?? -1) * 3.6
-                let band = adaptive.band(forSpeedKmh: speedKmh)
-                let interval = adaptive.interval(forSpeedKmh: speedKmh)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Now: \(speedKmh, specifier: "%.1f") km/h → \(band)")
-                        .font(.caption2.monospacedDigit())
-                    Text("Writing every \(Int(interval)) s")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-
-                // Thresholds (km/h). Crown-friendly steps keep these usable
-                // on the tiny screen. We deliberately don't enforce
-                // ordering across the three knobs — the band logic in
-                // `interval(forSpeedKmh:)` falls through cleanly if the
-                // user drags walking below stationary.
-                adaptiveSlider(
-                    title: "Stationary <",
-                    value: $adaptive.stationaryThresholdKmh,
-                    range: 0.1...5,
-                    step: 0.1,
-                    unit: "km/h",
-                    format: "%.1f"
-                )
-                adaptiveSlider(
-                    title: "Walking <",
-                    value: $adaptive.walkingThresholdKmh,
-                    range: 2...20,
-                    step: 0.5,
-                    unit: "km/h",
-                    format: "%.1f"
-                )
-                adaptiveSlider(
-                    title: "Running <",
-                    value: $adaptive.runningThresholdKmh,
-                    range: 5...40,
-                    step: 0.5,
-                    unit: "km/h",
-                    format: "%.1f"
-                )
-
-                // Intervals (seconds). Vehicle floor of 5 s mirrors the
-                // hottest cadence we'd ever want — anything tighter just
-                // burns CloudKit quota without adding map detail.
-                adaptiveIntervalSlider(
-                    title: "Stationary",
-                    value: $adaptive.stationaryInterval,
-                    range: 30...600,
-                    step: 10
-                )
-                adaptiveIntervalSlider(
-                    title: "Walking",
-                    value: $adaptive.walkingInterval,
-                    range: 15...300,
-                    step: 5
-                )
-                adaptiveIntervalSlider(
-                    title: "Running",
-                    value: $adaptive.runningInterval,
-                    range: 10...180,
-                    step: 5
-                )
-                adaptiveIntervalSlider(
-                    title: "Vehicle",
-                    value: $adaptive.vehicleInterval,
-                    range: 5...120,
-                    step: 5
-                )
-
-                Button("Reset defaults", role: .destructive) {
-                    adaptive.resetToDefaults()
-                }
-                .font(.caption2)
+    /// Asks WidgetKit which complications are currently installed and flips
+    /// `complicationMissing` when none of ours is on the active face. Fails
+    /// safe to "installed" (no nudge) if the query errors, so a transient
+    /// failure never nags the user. Uses the closure-based API (watchOS 9+)
+    /// rather than the async `currentConfigurations()` (watchOS 11+).
+    private func checkComplicationStatus() {
+        WidgetCenter.shared.getCurrentConfigurations { result in
+            let missing: Bool
+            switch result {
+            case .success(let widgets):
+                missing = !widgets.contains { $0.kind == Self.complicationKind }
+            case .failure:
+                missing = false
             }
-        } header: {
-            Text("Adaptive sampling")
-        } footer: {
-            Text("Off → Power profile interval. On → cadence depends on speed band, per this watch.")
-                .font(.caption2)
+            DispatchQueue.main.async { complicationMissing = missing }
         }
     }
 
-    /// Shared slider row for a `km/h` threshold. The label refreshes live
-    /// because the `@Published` binding emits `objectWillChange` on each
-    /// drag tick.
-    @ViewBuilder
-    private func adaptiveSlider(
-        title: String,
-        value: Binding<Double>,
-        range: ClosedRange<Double>,
-        step: Double,
-        unit: String,
-        format: String
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text("\(title) \(String(format: format, value.wrappedValue)) \(unit)")
-                .font(.caption2.monospacedDigit())
-            Slider(value: value, in: range, step: step)
-        }
-    }
-
-    /// Shared slider row for a `seconds` interval. Whole-number formatting
-    /// since sub-second cadence isn't meaningful for CL write rates.
-    @ViewBuilder
-    private func adaptiveIntervalSlider(
-        title: String,
-        value: Binding<TimeInterval>,
-        range: ClosedRange<Double>,
-        step: Double
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text("\(title) every \(Int(value.wrappedValue)) s")
-                .font(.caption2.monospacedDigit())
-            Slider(value: value, in: range, step: step)
-        }
-    }
+    // Adaptive-sampling sliders now live in `WatchAdaptiveSamplingView`
+    // (pushed via NavigationLink). See that file for the rationale —
+    // SwiftUI Sliders inside a List read the parent ScrollView's
+    // contentOffset, which spams the "grossly inefficient" warning;
+    // hosting them in a dedicated screen confines the warning to one
+    // view and keeps this Settings list quiet.
 
     // MARK: - Guardian section
 
@@ -294,12 +303,20 @@ struct WatchSettingsView: View {
                     .foregroundStyle(.secondary)
 
                 Button("Generate new") {
+                    WKInterfaceDevice.current().play(.click)
                     Task { await generateInvite(replacingExisting: true) }
                 }
                 .font(.caption2)
                 .disabled(isGenerating)
             } else {
                 Button {
+                    // Immediate tap acknowledgement — the share-creation
+                    // call below can take several seconds while CloudKit
+                    // sets up the shared zone (the WAL-checkpoint busy
+                    // messages in the console are CK mirroring locking
+                    // SQLite during that), so without a tap haptic the
+                    // user has no idea the button registered.
+                    WKInterfaceDevice.current().play(.click)
                     Task { await generateInvite(replacingExisting: false) }
                 } label: {
                     if isGenerating {
@@ -342,19 +359,28 @@ struct WatchSettingsView: View {
             let (_, _, url) = try await sharing.makeShareAndAwaitURL(for: profile)
             if replacingExisting { inviteURL = nil }
             inviteURL = url
+            // Distinct success haptic so the user knows the share is
+            // ready before they look at the screen — the call can take
+            // 3-8 s on slower connections.
+            WKInterfaceDevice.current().play(.success)
         } catch {
             inviteError = error.localizedDescription
+            WKInterfaceDevice.current().play(.failure)
         }
     }
 
     @MainActor
     private func sendViaPhone(_ url: URL) async {
+        WKInterfaceDevice.current().play(.click)
         isSendingViaPhone = true
         inviteError = nil
         defer { isSendingViaPhone = false }
         let ok = await connectivity.sendShareURL(url)
-        if !ok {
+        if ok {
+            WKInterfaceDevice.current().play(.success)
+        } else {
             inviteError = "Couldn't reach iPhone. Make sure MapMe is foregrounded on your phone, then try again."
+            WKInterfaceDevice.current().play(.failure)
         }
     }
 

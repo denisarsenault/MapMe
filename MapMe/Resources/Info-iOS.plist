@@ -34,6 +34,8 @@
 	<string>MapMe needs background access to keep recording your location while the app is closed, so your daily history stays complete.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>MapMe records your location to map your real-time position and build a 24-hour history.</string>
+	<key>NSMotionUsageDescription</key>
+	<string>MapMe uses motion data to detect when you start moving so it can automatically resume tracking without you having to open the app.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
@@ -62,18 +64,21 @@
 		<key>UIImageRespectsSafeAreaInsets</key>
 		<true/>
 	</dict>
+	<!--
+		Portrait-only on iPhone + iPad. Locking rotation lets the
+		layouts (especially the dashboard chrome and the map +
+		device-card stack) be tuned once for a known aspect ratio
+		instead of needing landscape variants. Both arrays contain
+		only `UIInterfaceOrientationPortrait`; the system blocks
+		rotation to any other orientation.
+	-->
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
-		<string>UIInterfaceOrientationLandscapeLeft</string>
-		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 	<key>UISupportedInterfaceOrientations~ipad</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
-		<string>UIInterfaceOrientationPortraitUpsideDown</string>
-		<string>UIInterfaceOrientationLandscapeLeft</string>
-		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 </dict>
 </plist>

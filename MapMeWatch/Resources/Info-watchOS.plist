@@ -26,6 +26,21 @@
 	<string>MapMe needs background access so periodic location samples can be recorded while the watch is on your wrist and the app is closed.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>MapMe records your watch's location to map your real-time position and build a 24-hour history.</string>
+	<key>NSMotionUsageDescription</key>
+	<string>MapMe uses motion data to detect when you start moving so it can automatically start Live tracking without you having to open the app.</string>
+	<!--
+		HealthKit is used purely to host an `HKWorkoutSession` around
+		Live tracking, so the watch app has enough runtime budget to
+		keep streaming GPS for hours. We do not read or write any
+		health samples — nothing lands in the Health or Activity app.
+		Required even if we never call `requestAuthorization` for
+		specific types: just having the entitlement triggers the
+		usage-description requirement at app validation.
+	-->
+	<key>NSHealthShareUsageDescription</key>
+	<string>MapMe uses a workout-style session to keep recording your location for the full length of a Live trip. No health data is read or saved.</string>
+	<key>NSHealthUpdateUsageDescription</key>
+	<string>MapMe uses a workout-style session to keep recording your location for the full length of a Live trip. No health data is read or saved.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>location</string>

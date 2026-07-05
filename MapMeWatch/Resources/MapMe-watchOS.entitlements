@@ -16,5 +16,16 @@
 	<array>
 		<string>group.com.mybrightzone.shared</string>
 	</array>
+	<!--
+		HealthKit is requested ONLY so we can host an `HKWorkoutSession`
+		around Live tracking. The session gives the watch app an
+		effectively unlimited runtime budget for continuous CL
+		streaming — `WKExtendedRuntimeSession` tops out around ~1-3
+		hours and then the OS suspends us, which is what the user
+		hit after a few hours of Start Live on. We do NOT read or
+		write any health samples; nothing lands in the Health app.
+	-->
+	<key>com.apple.developer.healthkit</key>
+	<true/>
 </dict>
 </plist>

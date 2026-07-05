@@ -6,6 +6,8 @@ struct WaitingForConsentView: View {
 
     var body: some View {
         VStack(spacing: 20) {
+            MapMeBrandImage()
+                .frame(width: 220)
             Image(systemName: "person.crop.circle.badge.clock")
                 .font(.system(size: 64))
                 .foregroundStyle(.tint)

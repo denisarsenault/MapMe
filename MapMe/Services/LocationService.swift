@@ -44,6 +44,10 @@ final class LocationService: NSObject, ObservableObject {
     /// against the *previous accepted* fix, not whatever raw CL
     /// happened to deliver in between.
     private var lastAcceptedLocation: CLLocation?
+    /// Rolling window of recently accepted fixes. Used by the
+    /// stationary-cluster suppressor. Capped at
+    /// `stationaryClusterWindow` — appending pops the oldest.
+    private var recentAcceptedFixes: [CLLocation] = []
 
     // MARK: - Fix-quality guards
     //
@@ -92,18 +96,47 @@ final class LocationService: NSObject, ObservableObject {
 
     /// Reported speed (km/h) below which the device is treated as
     /// "essentially stationary" for the purposes of the jitter
-    /// filter. 1 km/h is slower than a slow walk; anything below
-    /// it is rest-state CL noise rather than actual movement.
-    private static let stationarySpeedKmh: Double = 1.0
+    /// filter. Tightened to 0.5 km/h because CL routinely reports
+    /// 0 speed when the device is actually moving at parking-lot
+    /// crawl pace (3–8 km/h) — at low velocity the doppler-based
+    /// speed estimate is unreliable. The previous 1 km/h threshold
+    /// caused real parking-lot movement to be filtered as drift.
+    private static let stationarySpeedKmh: Double = 0.5
 
     /// Minimum displacement floor (metres) for the jitter filter.
-    /// Even with a "perfect" 3-metre accuracy fix, consecutive
-    /// samples from a stationary device routinely drift 5–10 m
-    /// — that drift is what produces the zigzag scribble on the
-    /// map. We require at least 15 m of movement before counting
-    /// it as real; for noisier fixes the threshold widens to the
-    /// fix's own `horizontalAccuracy`.
-    private static let stationaryJitterFloorMeters: CLLocationDistance = 15
+    /// Reduced from 15 m to 8 m so legitimate slow movement
+    /// (walking around a building, driving through a parking lot)
+    /// isn't rejected as drift. 8 m is still wider than the
+    /// 3–5 m drift pattern of a *truly* stationary good-fix
+    /// device, so the zigzag-on-the-desk case stays filtered.
+    /// For genuinely noisy fixes the floor widens automatically
+    /// to the fix's own `horizontalAccuracy`.
+    private static let stationaryJitterFloorMeters: CLLocationDistance = 8
+
+    /// Displacement (m) above which the cadence gate is bypassed.
+    /// Slow movement that takes longer than the cadence interval
+    /// (parking lots at .balanced's 90 s cadence, pedestrian
+    /// shortcuts at .battery's 5 min cadence) would otherwise
+    /// lose every intermediate fix to coalescing — the trail
+    /// looks like teleportation between two fixed waypoints, or
+    /// disappears entirely if the slow leg is short. 25 m is
+    /// well above stationary jitter noise but tight enough that a
+    /// 30 s drive through a Starbucks lot produces 3-5 writes
+    /// instead of 0-1.
+    private static let cadenceBypassMeters: CLLocationDistance = 25
+
+    /// Cluster-suppression radius (m). When the new fix is within this
+    /// distance of the centroid of the last few accepted fixes AND we
+    /// aren't clearly moving fast, treat it as more of the same rest
+    /// cluster and reject. This is what catches the "watch on desk,
+    /// GPS jitters 10–20 m every write" case without breaking slow
+    /// legitimate movement — walking / driving progresses the
+    /// centroid, so real moves keep exiting the cluster.
+    private static let stationaryClusterRadiusMeters: CLLocationDistance = 25
+    /// Size of the rolling window used to compute the cluster centroid.
+    /// Enough recent fixes to average out one bad sample; small enough
+    /// that a real walk moves the centroid within a couple of writes.
+    private static let stationaryClusterWindow: Int = 5
 
     init(persistence: PersistenceController = .shared) {
         self.persistence = persistence
@@ -143,7 +176,37 @@ final class LocationService: NSObject, ObservableObject {
         }
         // Seed initial state so `consentRequired` is correct at first launch.
         refreshConsentAndApply()
+
+        #if os(iOS)
+        // Motion watchdog: if tracking was ever stopped (backgrounded
+        // over the OS suspend threshold, a subsystem crash, user
+        // manually stopped from the widget) but the user then starts
+        // moving, promote back to tracking automatically. This
+        // realises the "Live in the background as the device moves"
+        // requirement without needing the user to reopen the app.
+        //
+        // macOS is a Guardian role with no meaningful motion signal
+        // to react to, so this is iOS-only.
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            MotionActivityMonitor.shared.start()
+            self.motionCancellable = MotionActivityMonitor.shared.$isMoving
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] moving in
+                    guard let self, moving, !self.isTracking else { return }
+                    self.startTracking()
+                }
+        }
+        #endif
     }
+
+    #if os(iOS)
+    /// Retained subscription to `MotionActivityMonitor.isMoving`.
+    /// Nilling it would stop the auto-restart, so we hold it for the
+    /// lifetime of the service singleton. iOS-only because Core
+    /// Motion isn't relevant on macOS.
+    private var motionCancellable: AnyCancellable?
+    #endif
 
     /// Applies the current `powerProfile` to the `CLLocationManager`. Called
     /// at init and whenever the user picks a new profile in Settings.
@@ -290,7 +353,19 @@ final class LocationService: NSObject, ObservableObject {
         let minInterval = adaptive.isEnabled
             ? adaptive.interval(forSpeedKmh: speedKmh)
             : powerProfile.minimumWriteIntervalSeconds
-        if let last = lastWriteAt,
+
+        // Distance-based cadence bypass. If the device has moved
+        // farther than `cadenceBypassMeters` since the last accepted
+        // fix, write this one even though the cadence interval
+        // hasn't elapsed. Without the bypass, a 30 s parking-lot
+        // crawl at .balanced (90 s cadence) produces 0–1 fixes and
+        // the trail looks like teleportation between waypoints.
+        let displacementSinceLastAccept = lastAcceptedLocation
+            .map { location.distance(from: $0) } ?? .infinity
+        let bypassCadence = displacementSinceLastAccept >= Self.cadenceBypassMeters
+
+        if !bypassCadence,
+           let last = lastWriteAt,
            now.timeIntervalSince(last) < minInterval {
             return
         }
@@ -322,8 +397,30 @@ final class LocationService: NSObject, ObservableObject {
             }
         }
 
+        // ── 4. Stationary cluster suppression ──────────────────────
+        //
+        // Catches the case the pair-wise jitter filter above misses:
+        // a stationary device whose fixes drift 15–25 m each write.
+        // Each new fix is >8 m from the previous accepted fix (passes
+        // jitter check) but still just orbiting the true resting
+        // location. Comparing to the CENTROID of the last few writes
+        // exposes that orbit — a genuinely stationary GPS trail
+        // produces a tight cluster the centroid parks in the middle
+        // of, so a new fix within `stationaryClusterRadiusMeters` of
+        // that centroid is more noise, not new movement.
+        //
+        // We only apply this when CL is reporting we're barely
+        // moving — so a slow walk that happens to double back
+        // through the same street still records.
+        if speedKmh < Self.stationarySpeedKmh,
+           let centroid = clusterCentroid(),
+           location.distance(from: centroid) < Self.stationaryClusterRadiusMeters {
+            return
+        }
+
         lastWriteAt = now
         lastAcceptedLocation = location
+        appendToClusterWindow(location)
 
         let deviceName = currentDeviceName()
         let deviceId = currentDeviceIdentifier()
@@ -395,6 +492,28 @@ final class LocationService: NSObject, ObservableObject {
     private func isConsentGranted() -> Bool {
         guard let profile = fetchProfile() else { return true } // no pairing yet → no gate
         return profile.consentGrantedAt != nil
+    }
+
+    // MARK: - Stationary cluster helpers
+
+    /// Centroid of the rolling window, or `nil` if we haven't
+    /// accumulated at least 3 fixes yet — with too few samples the
+    /// centroid is dominated by any single noisy fix and the check
+    /// misfires in either direction.
+    private func clusterCentroid() -> CLLocation? {
+        guard recentAcceptedFixes.count >= 3 else { return nil }
+        let n = Double(recentAcceptedFixes.count)
+        let lat = recentAcceptedFixes.map(\.coordinate.latitude).reduce(0, +) / n
+        let lon = recentAcceptedFixes.map(\.coordinate.longitude).reduce(0, +) / n
+        return CLLocation(latitude: lat, longitude: lon)
+    }
+
+    /// Appends a fix and evicts the oldest when the window overflows.
+    private func appendToClusterWindow(_ location: CLLocation) {
+        recentAcceptedFixes.append(location)
+        if recentAcceptedFixes.count > Self.stationaryClusterWindow {
+            recentAcceptedFixes.removeFirst(recentAcceptedFixes.count - Self.stationaryClusterWindow)
+        }
     }
 
     private func currentDeviceName() -> String {

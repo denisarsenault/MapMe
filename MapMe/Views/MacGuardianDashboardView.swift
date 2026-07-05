@@ -264,16 +264,17 @@ struct MacGuardianDashboardView: View {
         // has a visible MapMe identity even when the sidebar is
         // collapsed. `.navigation` slots it next to the
         // back/forward-style chrome on macOS Sequoia+.
+        //
+        // `MapMeBrandImage` picks the black-text MMLogoLight on a
+        // light toolbar and white-text MMLogo on a dark toolbar so
+        // the wordmark is always legible — the previous raw
+        // `Image("MMLogo")` always used white text and disappeared
+        // into the standard light macOS toolbar. Height-only frame
+        // preserves the wordmark's 10:3 aspect (a 22×22 square
+        // crushed it to a ~22×7 smudge).
         ToolbarItem(placement: .navigation) {
-            HStack(spacing: 6) {
-                Image("MMLogo")
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: 22, height: 22)
-                    .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
-                Text("MapMe")
-                    .font(.headline)
-            }
+            MapMeBrandImage()
+                .frame(height: 24)
         }
         ToolbarItemGroup(placement: .principal) {
             Picker("View mode", selection: $viewMode) {
@@ -311,6 +312,20 @@ struct MacGuardianDashboardView: View {
             .help(snapService.isEnabled
                   ? "Tracks follow road geometry via MKDirections. Toggle off for raw GPS lines."
                   : "Route each segment along real roads instead of drawing straight lines. Adds a few seconds the first time per polyline.")
+
+            // Live progress indicator. Without this the user has no
+            // visible cue that snap is running in the background — the
+            // tracks just look stale until they suddenly resolve.
+            if snapService.isWorking {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Snapping \(snapService.progress.completed)/\(snapService.progress.total)")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                .help("Snap-to-roads is computing routes via MKDirections. Apple's throttle limits this to ~50 segments/min; a long drive can take a minute or two on first view.")
+            }
 
             Button {
                 snapService.showRawOverlay.toggle()
@@ -541,16 +556,24 @@ private struct DashboardLifecycle: ViewModifier {
                 .publisher(for: .NSPersistentStoreRemoteChange)
                 .receive(on: DispatchQueue.main)
             ) { _ in
-                // Live mode: drop cached managed objects so @FetchRequest
-                // re-resolves with fresh records and the map redraws.
+                // Drop cached managed objects on EVERY remote-change so
+                // @FetchRequest re-resolves with fresh records and the
+                // map redraws. The previous `guard viewMode == .live`
+                // filter kept Day / Week views stale: a Minor device
+                // could push a fresh fix but the marker wouldn't move
+                // until the user clicked something (which triggered a
+                // separate render pass that happened to re-resolve the
+                // fetch). The FetchRequest's own predicate already
+                // filters by date range, so this is cheap when the new
+                // record falls outside the visible window — no visible
+                // redraw happens.
                 //
                 // `.receive(on: DispatchQueue.main)` is critical here —
                 // CloudKit posts the remote-change notification from its
-                // background import thread, and `refreshAllObjects` cascades
-                // into SwiftUI's @Published state. Mutating from the
-                // background trips Combine's "Publishing changes from
+                // background import thread, and `refreshAllObjects`
+                // cascades into SwiftUI's @Published state. Mutating from
+                // the background trips Combine's "Publishing changes from
                 // background threads" warning. Marshaling to main fixes it.
-                guard viewMode == .live else { return }
                 PersistenceController.shared.container.viewContext.refreshAllObjects()
             }
     }

@@ -1,4 +1,7 @@
 import SwiftUI
+#if os(macOS)
+import AppKit
+#endif
 
 struct SetPasscodeView: View {
     @EnvironmentObject private var auth: AuthService
@@ -17,22 +20,16 @@ struct SetPasscodeView: View {
             // large; wordmark (MMLogo) on iOS where the column is
             // phone-sized.
             #if os(tvOS)
-            Image("MMBrandMark")
-                .resizable()
-                .scaledToFit()
-                .frame(width: 130, height: 130)
+            // Full wordmark, forced-dark variant (white text) so it
+            // reads on the always-dark tvOS lock background.
+            MapMeBrandImage(forced: .dark)
+                .frame(width: 480)
             #elseif os(macOS)
-            Image("MMBrandMark")
-                .resizable()
-                .scaledToFit()
-                .frame(width: 120, height: 120)
+            MapMeBrandImage()
+                .frame(width: 280)
             #else
-            Image("MMLogo")
-                .resizable()
-                .scaledToFit()
-                .frame(width: 64, height: 64)
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .shadow(color: Color.black.opacity(0.15), radius: 6, y: 3)
+            MapMeBrandImage()
+                .frame(width: 240)
             #endif
 
             Image(systemName: "lock.rectangle.stack")
@@ -86,7 +83,29 @@ struct SetPasscodeView: View {
         .frame(maxWidth: Self.maxContentWidth)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
         #endif
+        #if os(macOS)
+        // Same compact NSWindow treatment as `LockView` — see the
+        // `resizeWindow(to:)` helper there for rationale and behaviour.
+        // On unlock the SetPasscode flow hands off to the main app
+        // (state goes from .unconfigured → .unlocked), so we expand
+        // back to the main-app size on disappear.
+        .onAppear { Self.resizeWindow(to: NSSize(width: 460, height: 560)) }
+        .onDisappear { Self.resizeWindow(to: NSSize(width: 900, height: 720)) }
+        #endif
     }
+
+    #if os(macOS)
+    private static func resizeWindow(to target: NSSize) {
+        guard let window = NSApp.windows.first(where: {
+            $0.isVisible && $0.styleMask.contains(.titled)
+        }) else { return }
+        var frame = window.frame
+        let topY = frame.maxY
+        frame.size = target
+        frame.origin.y = topY - target.height
+        window.setFrame(frame, display: true, animate: true)
+    }
+    #endif
 
     // MARK: - Platform sizing
     //

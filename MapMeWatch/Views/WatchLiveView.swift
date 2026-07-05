@@ -42,7 +42,7 @@ struct WatchLiveView: View {
         // the status row + map at the top in a fixed VStack; only the
         // small action button + optional error text scroll, which is
         // enough since the map is fixed-height (110 pt).
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 4) {
             if profiles.isEmpty {
                 ScrollView { setupBanner.padding(.horizontal, 4) }
             } else if profiles.first?.consentGrantedAt == nil {
@@ -50,12 +50,18 @@ struct WatchLiveView: View {
             } else {
                 statusRow
                     .padding(.horizontal, 4)
+                // 88 pt instead of 110 — on a 38/40/41 mm watch the
+                // 110 pt fixed map pushed the Stop/Start Live button
+                // off-screen below the nav title + status row. 88 pt
+                // still shows enough surrounding context to confirm
+                // "I'm at this place" while leaving room for the
+                // button without the user needing to scroll.
                 mapSection
-                    .frame(height: 110)
+                    .frame(height: 88)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                     .padding(.horizontal, 4)
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 6) {
                         actionButton
                         if let err = location.trackingError {
                             Text(err).font(.caption2).foregroundStyle(.red)
@@ -139,6 +145,8 @@ struct WatchLiveView: View {
             } label: {
                 Label("Stop Live", systemImage: "stop.fill")
             }
+            .font(.caption)
+            .controlSize(.small)
         } else {
             Button {
                 location.startLiveTracking()
@@ -146,6 +154,8 @@ struct WatchLiveView: View {
                 Label("Start Live (≈1 h)", systemImage: "play.fill")
             }
             .buttonStyle(.borderedProminent)
+            .font(.caption)
+            .controlSize(.small)
         }
     }
 
@@ -173,7 +183,12 @@ struct WatchLiveView: View {
                 ForEach(trips) { trip in
                     if trip.coordinates.count > 1 {
                         MapPolyline(coordinates: trip.coordinates)
-                            .stroke(.tint, lineWidth: 4)
+                            .stroke(
+                                trip.isFallback ? AnyShapeStyle(Color.accentColor.opacity(0.55)) : AnyShapeStyle(.tint),
+                                style: trip.isFallback
+                                    ? StrokeStyle(lineWidth: 3, dash: [8, 5])
+                                    : StrokeStyle(lineWidth: 4)
+                            )
                     }
                 }
                 Marker("", coordinate: center)

@@ -66,7 +66,7 @@ struct SplashView: View {
 private struct MapPinShape: Shape {
     func path(in rect: CGRect) -> Path {
         let w = rect.width
-        let h = rect.height
+        _ = rect.height
         let r = w / 2
         let cx = rect.midX
         let tipY = rect.maxY - 4

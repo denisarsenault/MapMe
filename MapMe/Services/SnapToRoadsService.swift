@@ -66,6 +66,28 @@ struct SnapProgress: Equatable, Sendable {
 struct IdentifiedTrip: Identifiable {
     let id: String
     let coordinates: [CLLocationCoordinate2D]
+    /// `true` for the raw straight-line chord that snap fell back to
+    /// when a segment couldn't be routed (gap too wide, time gap too
+    /// long, sparse data). Renderers style these differently — dashed
+    /// + lighter — so the user can visually tell "this part is
+    /// interpolation, not a real path." `false` for everything else,
+    /// including the rawTrips output (snap-off mode).
+    let isFallback: Bool
+    /// Timestamp of the first fix in the trip (or the parent trip,
+    /// for fallback/snapped chunks). Optional because some legacy
+    /// callers construct trips without timestamps. Renderers use it
+    /// to label each polyline with its start time (HH:MM).
+    let startDate: Date?
+
+    init(id: String,
+         coordinates: [CLLocationCoordinate2D],
+         isFallback: Bool = false,
+         startDate: Date? = nil) {
+        self.id = id
+        self.coordinates = coordinates
+        self.isFallback = isFallback
+        self.startDate = startDate
+    }
 }
 
 /// A single timestamped GPS fix. `Sendable` so it crosses concurrency
@@ -133,10 +155,21 @@ final class SnapToRoadsService: ObservableObject {
     }
     private static let kRawOverlayKey = "MapMe.snapToRoads.showRawOverlay"
 
-    /// Cached snapped polylines, keyed by a hash of the (subsampled) raw
-    /// coordinates. `@Published` so SwiftUI views re‑render when a snap
-    /// completes.
-    @Published private(set) var cache: [String: [CLLocationCoordinate2D]] = [:]
+    /// One contiguous polyline piece, annotated with whether it's the
+    /// real snapped geometry or a raw straight-line chord that snap
+    /// fell back to. Renderers style fallback chunks dashed so the
+    /// user can tell "this part is interpolation, not a real path."
+    struct SnappedChunk {
+        let coords: [CLLocationCoordinate2D]
+        let isFallback: Bool
+    }
+
+    /// Cached snapped polylines, keyed by a hash of the (subsampled)
+    /// raw coordinates. Each value is a list of contiguous chunks; a
+    /// trip is split into multiple chunks whenever the snap/raw kind
+    /// flips so each chunk can be rendered with its own style.
+    /// `@Published` so SwiftUI views re‑render when a snap completes.
+    @Published private(set) var cache: [String: [SnappedChunk]] = [:]
 
     /// Whether at least one snap is currently in flight.
     @Published private(set) var isWorking: Bool = false
@@ -144,6 +177,18 @@ final class SnapToRoadsService: ObservableObject {
     /// Aggregate progress across in-flight snaps. UI surfaces this as
     /// "snapping X/Y segments…".
     @Published private(set) var progress: SnapProgress = .init(completed: 0, total: 0)
+
+    /// `true` when at least one currently-cached snapped trail is degraded —
+    /// MKDirections throttled us (`GEOErrorDomain -3`) past retry exhaustion,
+    /// so some of that trail's segments are showing the raw GPS trace instead
+    /// of a road match. The UI surfaces this so a rate-limited render is
+    /// distinguishable from a genuine data gap. Clears when those trails
+    /// re-snap cleanly (cache invalidation / relaunch) or are evicted.
+    @Published private(set) var hasThrottledResults: Bool = false
+
+    /// Cache keys whose latest snap fell back due to throttling. Tracked so
+    /// `hasThrottledResults` reflects only trails still in the cache.
+    private var throttledKeys: Set<String> = []
 
     /// Subsampling minimum segment length in metres. 90 m drops standing-
     /// still GPS clusters and dense walking samples, cutting the number of
@@ -188,6 +233,53 @@ final class SnapToRoadsService: ObservableObject {
     /// between. 10 min handles "kid sits in class for 50 min, then walks
     /// home" naturally.
     static let tripBreakGapSeconds: TimeInterval = 600
+
+    /// Distance gap (metres) that also forces a trip break, even when
+    /// the time gap is below `tripBreakGapSeconds`. Catches the
+    /// off-grid case (iPhone XR / standalone watch with no cellular)
+    /// where GPS loses lock for several minutes, re-acquires several
+    /// km away, and the fixes happen to be within the 10-min window
+    /// — without this gate, snap would draw a fictional chord across
+    /// the whole gap and the trail would look "sporadic." 2 km is far
+    /// enough that a normal cadenced fix at vehicle pace stays under
+    /// it (90 s at 60 km/h = 1.5 km) but obviously sparse
+    /// lost-lock-and-recovered gaps don't.
+    // `nonisolated` so callers running off the main actor (the
+    // background persistence task, the detached snap segmenter) can
+    // read this constant without crossing the actor boundary — and
+    // so the default-argument expression on `segmentIntoTrips` below
+    // resolves in any isolation context. Safe because the value is
+    // an immutable `let`.
+    nonisolated static let tripBreakGapMeters: CLLocationDistance = 2000
+
+    /// Minimum total trip displacement (metres) at or above which a
+    /// trip is eligible for `MKDirections` snapping. Below this we
+    /// don't snap at all — we render the raw fixes.
+    ///
+    /// Rationale: at very short distances, `MKDirections` reliably
+    /// picks the *nearest road* it can route between the two
+    /// endpoints, which is often a parallel street rather than the
+    /// one the user is actually on. A user sitting at "651 Rookery
+    /// Ave" with the watch GPS drifting a few metres got snapped
+    /// onto Phonetia Dr because the drifted coords happened to be
+    /// fractionally closer to that street. For a trip that totals
+    /// less than 200 m of movement, the raw cluster of fixes near
+    /// the actual location is more truthful than a fictional road
+    /// route on the wrong street.
+    nonisolated static let minSnapTripMeters: CLLocationDistance = 200
+
+    /// Maximum allowed ratio of `snapped-route-length / raw-chord-length`
+    /// per segment. A snapped route that's much longer than the
+    /// straight-line distance between its endpoints almost always
+    /// means MKDirections chose the wrong road and is routing
+    /// around the block to get back to the destination. We reject
+    /// the snap and use the raw chord instead so the trail doesn't
+    /// lie about where the user actually was.
+    ///
+    /// 1.8× balances: a legitimate snap on a curved street is
+    /// typically 1.05–1.4× longer than the chord; a clearly-wrong
+    /// snap (out-and-back on a side street) is 2.5× and up.
+    nonisolated static let maxSnapStretchRatio: Double = 1.8
 
     /// Implied speed (km/h) above which a snap segment switches from
     /// `MKDirections` *walking* to *automobile*. Below this we ask for a
@@ -242,23 +334,42 @@ final class SnapToRoadsService: ObservableObject {
     func snappedTrips(_ fixes: [TimedFix]) -> [IdentifiedTrip] {
         let trips = Self.segmentIntoTrips(fixes,
                                           maxGapSeconds: Self.tripBreakGapSeconds)
-        return trips.enumerated().map { (idx, trip) in
-            IdentifiedTrip(
-                id: Self.tripID(trip, index: idx),
-                coordinates: snapTrip(trip)
-            )
+        return trips.enumerated().flatMap { (idx, trip) -> [IdentifiedTrip] in
+            let baseID = Self.tripID(trip, index: idx)
+            let chunks = snapTripChunks(trip)
+            // All chunks of a single trip share its start time (the
+            // first fix's timestamp) so the renderer can stamp the
+            // *whole* trip — not the chunk — with one label.
+            let tripStart = trip.first?.timestamp
+            // Tag each chunk with the parent trip ID + the chunk index
+            // + its kind so a snap result that flips between snapped
+            // and fallback partway through still keeps stable IDs per
+            // chunk across renders.
+            return chunks.enumerated().map { (chunkIdx, chunk) in
+                IdentifiedTrip(
+                    id: "\(baseID)#\(chunkIdx)\(chunk.isFallback ? "f" : "s")",
+                    coordinates: chunk.coords,
+                    isFallback: chunk.isFallback,
+                    startDate: tripStart
+                )
+            }
         }
     }
 
     /// Same trip segmentation but skips snapping. Used by the raw overlay
-    /// path and as a fallback when snap is disabled.
+    /// path and as a fallback when snap is disabled. Returns one
+    /// `IdentifiedTrip` per logical trip, `isFallback: false` (user
+    /// has snap off and is intentionally looking at raw geometry, so
+    /// there's nothing to dash).
     static func rawTrips(_ fixes: [TimedFix]) -> [IdentifiedTrip] {
         segmentIntoTrips(fixes, maxGapSeconds: tripBreakGapSeconds)
             .enumerated()
             .map { (idx, trip) in
                 IdentifiedTrip(
                     id: tripID(trip, index: idx),
-                    coordinates: trip.map(\.coordinate)
+                    coordinates: trip.map(\.coordinate),
+                    isFallback: false,
+                    startDate: trip.first?.timestamp
                 )
             }
     }
@@ -291,15 +402,45 @@ final class SnapToRoadsService: ObservableObject {
     /// `DirectionsRateLimiter` (1.5 s spacing + backoff-on-throttle).
     /// Worst case a very long trip snaps slowly; it never loses
     /// segments.
-    private func snapTrip(_ trip: [TimedFix]) -> [CLLocationCoordinate2D] {
-        guard trip.count >= 2 else { return trip.map(\.coordinate) }
+    /// Returns one-or-more contiguous chunks for the trip, each
+    /// labelled snapped or fallback. While the async snap is pending,
+    /// returns a single placeholder chunk with the raw coords marked
+    /// `isFallback: false` (it'll get replaced by the real chunked
+    /// result once snap completes — we don't want it dashing
+    /// optimistically during the loading flash).
+    private func snapTripChunks(_ trip: [TimedFix]) -> [SnappedChunk] {
+        guard trip.count >= 2 else {
+            return [SnappedChunk(coords: trip.map(\.coordinate), isFallback: false)]
+        }
+        // Micro-trip guard: don't ask MKDirections to route trips
+        // whose total displacement is too small. At sub-200 m scale
+        // the routing engine reliably picks the nearest parallel
+        // street rather than the one the user is actually on (the
+        // "at home, snapped onto Phonetia Dr instead of Rookery Ave"
+        // case). Raw fixes near the actual location are more
+        // truthful than a fictional snap to the wrong road.
+        if Self.totalDisplacement(trip) < Self.minSnapTripMeters {
+            return [SnappedChunk(coords: trip.map(\.coordinate), isFallback: false)]
+        }
         let sampled = Self.subsample(trip,
                                      minSegmentMeters: Self.subsampleThresholdMeters)
         let key = cacheKey(sampled.map(\.coordinate))
         if let cached = cache[key] { return cached }
         scheduleSnap(key: key, fixes: sampled)
-        // Return raw coords while we wait so the polyline doesn't vanish.
-        return trip.map(\.coordinate)
+        return [SnappedChunk(coords: trip.map(\.coordinate), isFallback: false)]
+    }
+
+    /// Sum of consecutive raw-chord distances across the trip.
+    /// Used by the micro-trip snap guard. Returns 0 for ≤1-fix trips.
+    nonisolated private static func totalDisplacement(_ trip: [TimedFix]) -> CLLocationDistance {
+        guard trip.count >= 2 else { return 0 }
+        var total: CLLocationDistance = 0
+        for i in 1..<trip.count {
+            let a = CLLocation(latitude: trip[i - 1].latitude, longitude: trip[i - 1].longitude)
+            let b = CLLocation(latitude: trip[i].latitude,     longitude: trip[i].longitude)
+            total += b.distance(from: a)
+        }
+        return total
     }
 
     /// Splits a chronologically-sorted sequence of fixes into separate
@@ -307,7 +448,8 @@ final class SnapToRoadsService: ObservableObject {
     /// `maxGapSeconds`. Empty input → empty output. Single-fix trips are
     /// kept so the caller can decide whether to render them as a point.
     static func segmentIntoTrips(_ fixes: [TimedFix],
-                                 maxGapSeconds: TimeInterval) -> [[TimedFix]]
+                                 maxGapSeconds: TimeInterval,
+                                 maxGapMeters: CLLocationDistance = tripBreakGapMeters) -> [[TimedFix]]
     {
         guard !fixes.isEmpty else { return [] }
         var trips: [[TimedFix]] = []
@@ -315,7 +457,16 @@ final class SnapToRoadsService: ObservableObject {
         for i in 1..<fixes.count {
             let fix = fixes[i]
             let last = current[current.count - 1]
-            if fix.timestamp.timeIntervalSince(last.timestamp) > maxGapSeconds {
+            let dt = fix.timestamp.timeIntervalSince(last.timestamp)
+            let lastLoc = CLLocation(latitude: last.latitude, longitude: last.longitude)
+            let thisLoc = CLLocation(latitude: fix.latitude, longitude: fix.longitude)
+            let distance = thisLoc.distance(from: lastLoc)
+            // Break on EITHER a long time gap OR a long distance gap.
+            // The distance gate catches the off-grid case where GPS
+            // re-acquires several km away within the time window —
+            // without it, the next segment would render as a single
+            // fictional chord across the whole gap.
+            if dt > maxGapSeconds || distance > maxGapMeters {
                 trips.append(current)
                 current = [fix]
             } else {
@@ -330,6 +481,8 @@ final class SnapToRoadsService: ObservableObject {
     func invalidateCache() {
         cache.removeAll()
         entryAddedAt.removeAll()
+        throttledKeys.removeAll()
+        hasThrottledResults = false
         try? FileManager.default.removeItem(at: Self.cacheURL)
     }
 
@@ -386,7 +539,14 @@ final class SnapToRoadsService: ObservableObject {
                 self.cache[key] = snapped
                 if complete {
                     self.entryAddedAt[key] = Date()
+                    self.throttledKeys.remove(key)
+                } else {
+                    // Incomplete == throttled (the only path that sets
+                    // `complete = false`). Flag it so the UI can show the
+                    // render is rate-limited, not data-gapped.
+                    self.throttledKeys.insert(key)
                 }
+                self.hasThrottledResults = !self.throttledKeys.isEmpty
                 self.inFlight.remove(key)
                 self.perKeyProgress.removeValue(forKey: key)
                 self.recomputeProgress()
@@ -416,7 +576,9 @@ final class SnapToRoadsService: ObservableObject {
         for (key, _) in sorted.prefix(removeCount) {
             cache.removeValue(forKey: key)
             entryAddedAt.removeValue(forKey: key)
+            throttledKeys.remove(key)
         }
+        hasThrottledResults = !throttledKeys.isEmpty
     }
 
     /// Process-wide throttle for `MKDirections.calculate()`. Shared across
@@ -424,16 +586,51 @@ final class SnapToRoadsService: ObservableObject {
     /// snapping at once) collectively stay under Apple's 50/min cap.
     private static let limiter = DirectionsRateLimiter()
 
-    /// Snaps a subsampled trip. Returns the coordinate path and a
-    /// `complete` flag: `false` means at least one segment fell back to
-    /// raw because MKDirections throttled us, so the caller should keep
-    /// the result in memory but NOT freeze it into the on-disk cache.
+    /// Snaps a subsampled trip. Returns a list of contiguous chunks
+    /// (each labelled snapped or fallback) plus a `complete` flag —
+    /// `false` means at least one segment fell back to raw because
+    /// MKDirections throttled us past retry exhaustion, so the caller
+    /// should keep the result in memory but NOT freeze it into the
+    /// on-disk cache.
+    ///
+    /// Chunk boundaries fall wherever the snap/raw kind changes, so a
+    /// trip that snaps fine for a while then hits a sparse-gap chord
+    /// then resumes snapping comes back as three chunks: snapped /
+    /// fallback / snapped. Renderers style fallback chunks as dashed
+    /// to make the interpolation visible.
     private static func compute(
         fixes: [TimedFix]
-    ) async -> (coordinates: [CLLocationCoordinate2D], complete: Bool) {
+    ) async -> (chunks: [SnappedChunk], complete: Bool) {
         let total = max(0, fixes.count - 1)
-        var result: [CLLocationCoordinate2D] = []
+        var chunks: [SnappedChunk] = []
+        var current: (coords: [CLLocationCoordinate2D], isFallback: Bool)? = nil
         var complete = true
+
+        // Append a snapped/raw segment to the current chunk if its
+        // kind matches; otherwise close the current chunk and open a
+        // new one. The first coord of a follow-on segment duplicates
+        // the previous segment's endpoint, so we drop it when merging.
+        func appendSegment(_ segCoords: [CLLocationCoordinate2D],
+                           isFallback kind: Bool) {
+            guard !segCoords.isEmpty else { return }
+            if var cur = current, cur.isFallback == kind {
+                cur.coords.append(contentsOf: segCoords.dropFirst())
+                current = cur
+            } else {
+                if let cur = current {
+                    chunks.append(SnappedChunk(coords: cur.coords, isFallback: cur.isFallback))
+                }
+                // Start the new chunk with the shared endpoint so the
+                // visual line stays connected across the kind boundary
+                // (otherwise there'd be a 1-segment gap at every flip).
+                var start: [CLLocationCoordinate2D] = []
+                if let prevLast = current?.coords.last {
+                    start = [prevLast]
+                }
+                start.append(contentsOf: segCoords)
+                current = (coords: start, isFallback: kind)
+            }
+        }
 
         for i in 0..<total {
             let from = fixes[i]
@@ -483,8 +680,9 @@ final class SnapToRoadsService: ObservableObject {
                 || timeDelta > maxSnapTimeDeltaSeconds
                 || speedKmh > 250
             {
-                if result.isEmpty { result.append(fromCoord) }
-                result.append(toCoord)
+                // Hard-gate raw fallback — flagged so the renderer can
+                // dash it.
+                appendSegment([fromCoord, toCoord], isFallback: true)
                 continue
             }
 
@@ -521,7 +719,20 @@ final class SnapToRoadsService: ObservableObject {
                             &coords,
                             range: NSRange(location: 0, length: polyline.pointCount)
                         )
-                        segmentCoords = coords
+                        // Snap-quality guard. If the route MKDirections
+                        // returned is meaningfully longer than the
+                        // straight-line distance between the two
+                        // endpoints, it almost certainly chose the
+                        // wrong road and is detouring around the
+                        // block. Reject it and fall back to the raw
+                        // chord — better to under-draw a curved road
+                        // than to misattribute the user's path to a
+                        // street they were never on.
+                        if route.distance > distance * Self.maxSnapStretchRatio {
+                            segmentCoords = [fromCoord, toCoord]
+                        } else {
+                            segmentCoords = coords
+                        }
                     } else {
                         // Empty route response (no path exists): accept
                         // the raw straight line for this segment.
@@ -547,17 +758,25 @@ final class SnapToRoadsService: ObservableObject {
                 }
             }
 
+            // Determine fallback flag for this segment: if MKDirections
+            // returned a route, the coords contain its polyline → snapped
+            // chunk. If it returned an empty route, or all retries hit
+            // throttle, segmentCoords is just [from, to] → fallback chunk.
             let coords = segmentCoords ?? [fromCoord, toCoord]
-            if result.isEmpty {
-                result.append(contentsOf: coords)
-            } else {
-                // Skip the first coord — it duplicates the previous
-                // segment's endpoint.
-                result.append(contentsOf: coords.dropFirst())
-            }
+            // Heuristic: a "real" snap returns the route geometry which
+            // is typically several intermediate points between from and
+            // to. A fallback is exactly the 2-point straight line. We
+            // also pass through `complete=false` info — fallback after
+            // throttle exhaustion both forces this segment to fallback
+            // AND marks the whole result incomplete (no disk cache).
+            let isFallback = coords.count <= 2
+            appendSegment(coords, isFallback: isFallback)
         }
 
-        return (result, complete)
+        if let cur = current {
+            chunks.append(SnappedChunk(coords: cur.coords, isFallback: cur.isFallback))
+        }
+        return (chunks, complete)
     }
 
     private func cacheKey(_ coords: [CLLocationCoordinate2D]) -> String {
@@ -585,9 +804,14 @@ final class SnapToRoadsService: ObservableObject {
         }
     }
 
+    private struct StoredChunk: Codable {
+        let coords: [StoredCoord]
+        let isFallback: Bool
+    }
+
     private struct DiskEntry: Codable {
         let key: String
-        let coords: [StoredCoord]
+        let chunks: [StoredChunk]
         let addedAt: Date
     }
 
@@ -604,13 +828,21 @@ final class SnapToRoadsService: ObservableObject {
     //     branch for vehicle-pace segments.
     // v3: mode-aware distance gate (800 m walking / 5 km vehicle).
     // v4: subsample 50 m → 90 m + per-trip segment cap.
-    // v5 (this bump): removed the segment cap — striding by index
-    //     opened gaps wider than the snap distance gate, so capped
-    //     trips rendered missing/diagonal raw segments. Throttle is now
-    //     handled by retry-after-backoff instead. v4 entries cached
-    //     those gappy results; bump to discard them so trails re-snap
-    //     continuously.
-    nonisolated private static let cacheVersion = 5
+    // v5: removed the segment cap — striding by index opened gaps
+    //     wider than the snap distance gate, so capped trips rendered
+    //     missing/diagonal raw segments. Throttle handled by retry-
+    //     after-backoff instead.
+    // v6: cached value type changed from a flat `[StoredCoord]`
+    //     polyline to `[StoredChunk]` so each fallback chord can
+    //     be rendered dashed independently from the snapped
+    //     portions. v5 entries can't be deserialized into the new
+    //     shape; bump invalidates them cleanly.
+    // v7 (this bump): trip-level micro-trip guard (< 200 m total
+    //     displacement → no snap) + per-segment stretch-ratio
+    //     guard (snap rejected if > 1.8× straight distance). v6
+    //     entries that captured wrong-road routes from before the
+    //     guards have to be flushed; bump invalidates them.
+    nonisolated private static let cacheVersion = 7
 
     /// `Caches/MapMe/snap-roads-cache.json`. We use `.cachesDirectory` (not
     /// `.applicationSupportDirectory`) because this data is rebuildable from
@@ -632,7 +864,10 @@ final class SnapToRoadsService: ObservableObject {
               disk.version == Self.cacheVersion
         else { return }
         for entry in disk.entries {
-            cache[entry.key] = entry.coords.map(\.coord)
+            cache[entry.key] = entry.chunks.map {
+                SnappedChunk(coords: $0.coords.map(\.coord),
+                             isFallback: $0.isFallback)
+            }
             entryAddedAt[entry.key] = entry.addedAt
         }
     }
@@ -657,14 +892,24 @@ final class SnapToRoadsService: ObservableObject {
     private func persistToDisk() {
         // Snapshot on MainActor (we are MainActor-isolated), then encode +
         // write off the main thread so a large cache doesn't stutter the UI.
-        let snapshot: [(String, [CLLocationCoordinate2D], Date)] = cache.map { (k, v) in
-            (k, v, entryAddedAt[k] ?? Date())
+        // We pre-flatten SnappedChunk into a Sendable [(coords, isFallback)]
+        // tuple here so the Task.detached closure doesn't capture
+        // SnappedChunk by reference into a non-Sendable context.
+        let snapshot: [(String, [(coords: [CLLocationCoordinate2D], isFallback: Bool)], Date)] = cache.map { (k, chunks) in
+            (k,
+             chunks.map { (coords: $0.coords, isFallback: $0.isFallback) },
+             entryAddedAt[k] ?? Date())
         }
         Task.detached(priority: .background) {
-            let entries = snapshot.map { (k, coords, addedAt) in
-                DiskEntry(key: k,
-                          coords: coords.map { StoredCoord($0) },
-                          addedAt: addedAt)
+            let entries = snapshot.map { (k, chunks, addedAt) in
+                DiskEntry(
+                    key: k,
+                    chunks: chunks.map {
+                        StoredChunk(coords: $0.coords.map { StoredCoord($0) },
+                                    isFallback: $0.isFallback)
+                    },
+                    addedAt: addedAt
+                )
             }
             let disk = DiskCache(version: Self.cacheVersion, entries: entries)
             if let data = try? JSONEncoder().encode(disk) {

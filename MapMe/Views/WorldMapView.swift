@@ -25,6 +25,17 @@ struct WorldMapView: View {
     let snapToRoads: Bool
     let colors: [NSManagedObjectID: Color]
     @Binding var mapSelection: NSManagedObjectID?
+    /// Map base style — standard streets, satellite imagery, or hybrid
+    /// (imagery + labels). Defaults to `.standard` so existing callers
+    /// (Mac dashboard, day detail) keep their current rendering.
+    var style: WorldMapStyle = .standard
+    /// Pulse counters driven by external Zoom In / Zoom Out buttons
+    /// (tvOS has no pinch gesture; the dashboard wires these to its
+    /// top-bar zoom controls). Each increment shrinks the camera span
+    /// by 0.5× (zoom in) or doubles it (zoom out). Default of 0 keeps
+    /// existing callers unaffected.
+    var zoomInPulse: Int = 0
+    var zoomOutPulse: Int = 0
 
     @State private var camera: MapCameraPosition = .automatic
     @ObservedObject private var snapService = SnapToRoadsService.shared
@@ -35,6 +46,7 @@ struct WorldMapView: View {
                 profileContent(for: profile)
             }
         }
+        .mapStyle(style.mapKitStyle)
         .mapControls {
             MapCompass()
             MapScaleView()
@@ -42,9 +54,22 @@ struct WorldMapView: View {
         .overlay(alignment: .topLeading) { legend }
         .overlay(alignment: .bottomLeading) { dateBadge }
         .onAppear { zoomToFit() }
-        .onChange(of: profiles.map(\.objectID)) { _, _ in zoomToFit() }
+        // Deliberately NOT auto-fitting on every `profiles` array
+        // change. `@FetchRequest` re-emits a fresh `Array` on every
+        // CoreData notification (Live mode in particular fires these
+        // constantly via `refreshAllObjects`), and re-fitting on
+        // each emit was snapping the camera back to fit-all-profiles
+        // every time the user panned or zoomed — most visibly on
+        // tvOS where the user enters pan mode, repositions, then
+        // exits and watches the map jump back.
+        //
+        // The two genuinely user-driven triggers (date change, time
+        // scrubber) still re-fit so changing the date range gives a
+        // fresh framing. Zoom buttons adjust the current camera.
         .onChange(of: dateRange) { _, _ in zoomToFit() }
         .onChange(of: timeCutoff) { _, _ in zoomToFit() }
+        .onChange(of: zoomInPulse) { _, _ in zoomBy(factor: 0.5) }
+        .onChange(of: zoomOutPulse) { _, _ in zoomBy(factor: 2.0) }
     }
 
     // MARK: - Per-profile map content
@@ -81,13 +106,28 @@ struct WorldMapView: View {
         // Trip polylines (snapped or raw). `ForEach(trips)` uses each
         // trip's stable `id`, so unchanged trips keep their existing
         // `MapPolyline` (and Metal drawable) across re-renders.
+        //
+        // NOTE: a previous attempt added a sibling `ForEach` of
+        // `Annotation` here to stamp each trip with its start time
+        // (HH:MM capsule). Doing so triggered Map's automatic
+        // framing to fire on every annotation churn — undoing the
+        // pan-mode camera-preservation fix from the prior commit.
+        // Trip start-time labels will need a separate rendering
+        // path (e.g. SwiftUI overlay outside the Map projected via
+        // MapReader / MapProxy) so they don't perturb the Map's
+        // internal camera state.
         let trips: [IdentifiedTrip] = snapToRoads
             ? snapService.snappedTrips(fixes)
             : SnapToRoadsService.rawTrips(fixes)
         ForEach(trips) { trip in
             if trip.coordinates.count > 1 {
                 MapPolyline(coordinates: trip.coordinates)
-                    .stroke(color, lineWidth: liveMode ? 5 : 4)
+                    .stroke(
+                        trip.isFallback ? color.opacity(0.55) : color,
+                        style: trip.isFallback
+                            ? StrokeStyle(lineWidth: liveMode ? 4 : 3, dash: [10, 6])
+                            : StrokeStyle(lineWidth: liveMode ? 5 : 4)
+                    )
             }
         }
 
@@ -228,6 +268,71 @@ struct WorldMapView: View {
             longitudeDelta: max(0.01, ((lons.max() ?? 0) - (lons.min() ?? 0)) * 1.4)
         )
         camera = .region(MKCoordinateRegion(center: center, span: span))
+    }
+
+    /// Multiplies the current camera region's span by `factor`,
+    /// preserving the centre. Used by the dashboard's Zoom In (0.5)
+    /// and Zoom Out (2.0) buttons, since tvOS has no pinch gesture.
+    /// Clamps spans so we can't zoom in past street level or out past
+    /// the whole globe.
+    private func zoomBy(factor: Double) {
+        guard let region = camera.region else {
+            // Camera is in `.automatic` mode and hasn't resolved to a
+            // concrete region yet. Force a fit first so we have a
+            // baseline to multiply.
+            zoomToFit()
+            return
+        }
+        let newSpan = MKCoordinateSpan(
+            latitudeDelta:  min(170, max(0.0008, region.span.latitudeDelta  * factor)),
+            longitudeDelta: min(170, max(0.0008, region.span.longitudeDelta * factor))
+        )
+        withAnimation(.easeInOut(duration: 0.25)) {
+            camera = .region(MKCoordinateRegion(center: region.center, span: newSpan))
+        }
+    }
+}
+
+/// Base map style. Kept as our own enum (rather than passing
+/// `MapKit.MapStyle` directly) so the dashboard can store it in
+/// `@State` without conformance gymnastics — `MapStyle` isn't
+/// `Equatable`, which breaks `@State`'s diff-on-change behaviour.
+enum WorldMapStyle: String, CaseIterable, Hashable {
+    case standard, satellite, hybrid
+
+    var mapKitStyle: MapStyle {
+        switch self {
+        case .standard:  return .standard
+        case .satellite: return .imagery
+        case .hybrid:    return .hybrid
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .standard:  return "Standard"
+        case .satellite: return "Satellite"
+        case .hybrid:    return "Hybrid"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .standard:  return "map"
+        case .satellite: return "globe.americas.fill"
+        case .hybrid:    return "map.fill"
+        }
+    }
+
+    /// Cycle order for the tvOS style-toggle button (Standard →
+    /// Satellite → Hybrid → Standard). Single-button cycle keeps
+    /// the top-bar footprint tight versus a 3-segment picker.
+    var next: WorldMapStyle {
+        switch self {
+        case .standard:  return .satellite
+        case .satellite: return .hybrid
+        case .hybrid:    return .standard
+        }
     }
 }
 

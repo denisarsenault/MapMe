@@ -1,5 +1,8 @@
 import SwiftUI
 import CoreData
+#if canImport(UIKit)
+import UIKit
+#endif
 
 struct SettingsView: View {
     @EnvironmentObject private var auth: AuthService
@@ -73,6 +76,10 @@ struct SettingsView: View {
                 adaptiveSamplingSection
                 #endif
 
+                if roleStore.role == .guardian {
+                    guardianAudioAlertSection
+                }
+
                 Section("Data") {
                     Button("Run archive pass now") {
                         ArchiveService(context: PersistenceController.shared.newBackgroundContext())
@@ -82,7 +89,10 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    LabeledContent("Version", value: appVersion)
+                    LabeledContent("MapMe", value: appVersion)
+                    LabeledContent(osLabel, value: osVersion)
+                } header: {
+                    Text("Versions")
                 }
             }
             #if os(macOS)
@@ -91,6 +101,7 @@ struct SettingsView: View {
             .frame(maxWidth: 640)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             .navigationTitle("Settings")
+            .mapMeBrandToolbar()
             .sheet(isPresented: $showChangePasscode) {
                 NavigationStack { SetPasscodeView() }
             }
@@ -109,16 +120,40 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - Adaptive sampling
+    // MARK: - Guardian audio alerts
+
+    /// Guardian-side audio alerts. When enabled, the app speaks a
+    /// Minor's nickname aloud on the Guardian device whenever a fresh
+    /// fix arrives after ≥ 10 min of stillness — "Alice is on the
+    /// move." Backed by `GuardianAudioAlertService.shared`. Only
+    /// shown when the current role is `.guardian`; nickname editing
+    /// lives on each profile's detail screen. Available on iOS,
+    /// macOS, and tvOS.
+    @ViewBuilder
+    private var guardianAudioAlertSection: some View {
+        Section {
+            Toggle(isOn: Binding(
+                get: { GuardianAudioAlertService.shared.isEnabled },
+                set: { GuardianAudioAlertService.shared.isEnabled = $0 }
+            )) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Speak when a device starts moving")
+                    Text("Announces the device's nickname aloud when new fixes arrive after a period of stillness.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } header: {
+            Text("Family alerts")
+        } footer: {
+            Text("Edit each device's spoken nickname from the Family tab → tap a device.")
+                .font(.footnote)
+        }
+    }
+
+    // MARK: - Adaptive sampling (iOS/macOS only; watch has its own screen)
 
     #if os(iOS) || os(macOS)
-    /// Speed-band sliders. Each one writes through to UserDefaults via the
-    /// `@Published`'s `didSet`, so a value the user just dragged is in
-    /// effect on the very next CL fix — no restart, no save button.
-    ///
-    /// On macOS the live speed/band diagnostic still reflects whatever the
-    /// LocationService is reporting on iOS — on a Mac without a paired
-    /// LocationService env object we just show "—".
     @ViewBuilder
     private var adaptiveSamplingSection: some View {
         Section {
@@ -247,6 +282,32 @@ struct SettingsView: View {
         let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
         let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
         return "\(v) (\(b))"
+    }
+
+    /// Human-friendly label for the current OS (e.g. "iOS", "iPadOS",
+    /// "macOS", "tvOS"). Distinguishes iPhone from iPad on iOS where
+    /// the user might have both.
+    private var osLabel: String {
+        #if os(iOS)
+        return UIDevice.current.userInterfaceIdiom == .pad ? "iPadOS" : "iOS"
+        #elseif os(macOS)
+        return "macOS"
+        #elseif os(tvOS)
+        return "tvOS"
+        #else
+        return "OS"
+        #endif
+    }
+
+    /// Semantic-version string of the running OS (e.g. "17.5.1").
+    /// Uses `ProcessInfo`'s canonical version string rather than
+    /// `UIDevice.systemVersion` so all platforms take the same path.
+    private var osVersion: String {
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        if v.patchVersion > 0 {
+            return "\(v.majorVersion).\(v.minorVersion).\(v.patchVersion)"
+        }
+        return "\(v.majorVersion).\(v.minorVersion)"
     }
 
     private func deleteAll() {

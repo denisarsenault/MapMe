@@ -80,6 +80,7 @@ struct PairingView: View {
         .frame(maxWidth: 640)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
         .navigationTitle("Guardian")
+        .mapMeBrandToolbar()
         .onAppear {
             if profileName.isEmpty {
                 #if os(iOS) || os(tvOS)
@@ -147,8 +148,11 @@ private struct CloudShareSheet: UIViewControllerRepresentable {
 
     func makeUIViewController(context: Context) -> UICloudSharingController {
         let vc = UICloudSharingController(share: share, container: container)
-        // Read-write so the Guardian can write `consentGrantedAt` back into
-        // the share. Private so only invited participants can join.
+        // Pin read-write so the Guardian can write `consentGrantedAt` back
+        // into the share — omitting `.allowReadOnly` removes the "View only"
+        // toggle entirely, so the Minor can't accidentally send a read-only
+        // invite that leaves "Grant consent" dead on the Guardian's device.
+        // `.allowPrivate` keeps it invite-only (no public toggle).
         vc.availablePermissions = [.allowReadWrite, .allowPrivate]
         vc.delegate = context.coordinator
         return vc

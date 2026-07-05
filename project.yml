@@ -95,6 +95,7 @@ targets:
       - path: MapMe/Services/SharingService.swift
       - path: MapMe/Services/AuthService.swift
       - path: MapMe/Services/SnapToRoadsService.swift
+      - path: MapMe/Services/MotionActivityMonitor.swift
     dependencies:
       - target: MapMeWatchWidgets
         embed: true

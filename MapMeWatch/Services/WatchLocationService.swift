@@ -4,6 +4,8 @@ import CoreData
 import Combine
 import WatchKit
 import WidgetKit
+import HealthKit
+import UserNotifications
 
 /// Hybrid watchOS tracking:
 ///
@@ -45,8 +47,85 @@ final class WatchLocationService: NSObject, ObservableObject {
     }
     private static let kPowerProfileKey = "MapMe.powerProfile"
 
+    /// When on, MapMe arms a "tracking paused" local notification that fires
+    /// if no fix is recorded for `Self.watchdogInterval`. Every successful
+    /// fix pushes it forward, so it only ever delivers when tracking actually
+    /// stops — most importantly after the watch runs out of power and is
+    /// recharged, since watchOS won't relaunch the app on its own. Opt-in
+    /// (default off): a watch left off-wrist on the charger can legitimately
+    /// stop refreshing, which would otherwise alert at an unexpected time.
+    @Published var pauseAlertEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(pauseAlertEnabled, forKey: Self.kPauseAlertKey)
+            if pauseAlertEnabled {
+                requestNotificationAuthorization()
+                armTrackingWatchdog()
+            } else {
+                cancelTrackingWatchdog()
+            }
+        }
+    }
+    private static let kPauseAlertKey = "MapMe.pauseAlertEnabled"
+
+    /// How long without a recorded fix before the "tracking paused" alert
+    /// fires. 30 min is aggressive — it catches real outages quickly but
+    /// can false-alert if watchOS defers a background refresh during a
+    /// tight-battery window, or if the user takes the watch off for a
+    /// workout that runs long. The toggle's footer in
+    /// `WatchSettingsView` warns about the off-wrist case.
+    private static let watchdogInterval: TimeInterval = 30 * 60
+    private static let watchdogNotificationID = "com.mapme.tracking-watchdog"
+
+    /// When on, `MotionActivityMonitor` transitions from stationary →
+    /// moving (walking, running, cycling, automotive) automatically
+    /// call `startLiveTracking()`. This is what the user meant by "when
+    /// the device starts moving, MapMe should be running Live in the
+    /// background" — without motion classification the app has no way
+    /// to know movement started until CL happens to deliver a fix, and
+    /// CL only delivers reliably when Live is *already* running.
+    ///
+    /// Default `true`: matches the requested behaviour. User can turn
+    /// it off in `WatchSettingsView` if they want manual control only.
+    @Published var autoStartOnMotion: Bool {
+        didSet {
+            UserDefaults.standard.set(autoStartOnMotion, forKey: Self.kAutoStartOnMotionKey)
+            if autoStartOnMotion {
+                MotionActivityMonitor.shared.start()
+            }
+        }
+    }
+    private static let kAutoStartOnMotionKey = "MapMe.autoStartOnMotion"
+
+    /// Timestamp of the last "motion detected" transition. Used to
+    /// gate the auto-stop side: we only auto-stop Live if the classifier
+    /// has been reporting stationary continuously for
+    /// `autoStopStationaryInterval` — a single stationary blip during
+    /// a walk (traffic light, checking a shop window) shouldn't kill
+    /// the workout session.
+    private var lastMotionAt: Date?
+    private static let autoStopStationaryInterval: TimeInterval = 5 * 60
+
+    private var motionCancellable: AnyCancellable?
+
     private let manager = CLLocationManager()
     private let persistence: PersistenceController
+    private let healthStore = HKHealthStore()
+    /// Active `HKWorkoutSession` if Live tracking landed on the
+    /// HealthKit path. Workout sessions on the watch get effectively
+    /// unlimited runtime, which is the whole point of using them here
+    /// — `WKExtendedRuntimeSession` caps out around ~1-3 hours total
+    /// per day and Live tracking dies after that.
+    private var workoutSession: HKWorkoutSession?
+    /// The workout builder that goes with `workoutSession`. We don't
+    /// actually collect any health samples, but the builder has to
+    /// exist for the session to be valid; we end it without saving
+    /// in `stopLiveTracking()`.
+    private var workoutBuilder: HKLiveWorkoutBuilder?
+    /// `WKExtendedRuntimeSession` fallback used only when HealthKit
+    /// isn't authorised. This is the original Live-tracking channel —
+    /// works for ~1-3 hours then the OS suspends us. Pre-existing
+    /// users who haven't tapped Start Live since this change use this
+    /// path until they grant Health permission.
     private var runtimeSession: WKExtendedRuntimeSession?
     private var oneShotCompletion: (() -> Void)?
     private var lastWriteAt: Date?
@@ -54,6 +133,10 @@ final class WatchLocationService: NSObject, ObservableObject {
     /// teleport guard in `persist` — see the matching field +
     /// thresholds on iOS' `LocationService` for the rationale.
     private var lastAcceptedLocation: CLLocation?
+    /// Rolling window of recently accepted fixes, used by the
+    /// stationary cluster suppressor. Capped at
+    /// `stationaryClusterWindow`.
+    private var recentAcceptedFixes: [CLLocation] = []
 
     // MARK: - Fix-quality guards (mirror of iOS LocationService)
 
@@ -75,13 +158,33 @@ final class WatchLocationService: NSObject, ObservableObject {
     /// Stationary jitter thresholds — see the matching constants on
     /// iOS' `LocationService`. Identical values so a paired phone /
     /// watch produce comparable trails when both are recording.
-    private static let stationarySpeedKmh: Double = 1.0
-    private static let stationaryJitterFloorMeters: CLLocationDistance = 15
+    private static let stationarySpeedKmh: Double = 0.5
+    private static let stationaryJitterFloorMeters: CLLocationDistance = 8
+    /// Distance-based cadence bypass — see comment on the iOS twin.
+    /// Without this, parking-lot crawls (<90 s through the lot) lose
+    /// every intermediate fix to the cadence coalescer.
+    private static let cadenceBypassMeters: CLLocationDistance = 25
+
+    /// Stationary cluster suppressor — see iOS twin. Watch GPS jitter
+    /// is typically worse than iPhone (smaller antenna, wrist
+    /// obstruction), so this filter is what actually stops the
+    /// scribble around a stationary rest location.
+    private static let stationaryClusterRadiusMeters: CLLocationDistance = 25
+    private static let stationaryClusterWindow: Int = 5
 
     private init(persistence: PersistenceController = .shared) {
         self.persistence = persistence
         let stored = UserDefaults.standard.string(forKey: Self.kPowerProfileKey)
         self.powerProfile = stored.flatMap(PowerProfile.init(rawValue:)) ?? .balanced
+        self.pauseAlertEnabled = UserDefaults.standard.bool(forKey: Self.kPauseAlertKey)
+        // Default `true` for auto-start on motion so the "MapMe should
+        // be running Live when the device is moving" behaviour holds
+        // out of the box. UserDefaults returns `false` for a missing
+        // key, so seed a default the first launch.
+        if UserDefaults.standard.object(forKey: Self.kAutoStartOnMotionKey) == nil {
+            UserDefaults.standard.set(true, forKey: Self.kAutoStartOnMotionKey)
+        }
+        self.autoStartOnMotion = UserDefaults.standard.bool(forKey: Self.kAutoStartOnMotionKey)
         super.init()
         manager.delegate = self
         // Apply the loaded profile to the CL manager. `applyPowerProfile()`
@@ -102,11 +205,47 @@ final class WatchLocationService: NSObject, ObservableObject {
         // value on the next run-loop tick.
 
         observeRemoteChanges()
+        // Wire the shared motion classifier. Even if the user has
+        // `autoStartOnMotion` off, we let the monitor run so a later
+        // toggle-on has fresh data. The subscription is guarded — we
+        // only auto-start Live if the flag is true AND consent is
+        // granted.
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            MotionActivityMonitor.shared.start()
+            self.motionCancellable = MotionActivityMonitor.shared.$isMoving
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] moving in
+                    self?.handleMotionChange(moving: moving)
+                }
+        }
         // Refresh + mirror are deferred to the next main-actor tick so we
         // don't call `WidgetCenter.shared.reloadTimelines` while the
         // singleton's `static let shared` is still running.
         Task { @MainActor [weak self] in
             self?.refreshConsentAndApply()
+        }
+    }
+
+    /// Reacts to a `MotionActivityMonitor.isMoving` transition. When
+    /// the user starts moving and auto-start is enabled, this brings
+    /// Live tracking up. When they stop moving for
+    /// `autoStopStationaryInterval`, we tear the session down so a
+    /// watch parked on a desk doesn't hold `HKWorkoutSession` open
+    /// forever (burning battery + skewing daily activity metrics).
+    private func handleMotionChange(moving: Bool) {
+        guard autoStartOnMotion else { return }
+        guard isAuthorized, isConsentGranted() else { return }
+        if moving {
+            lastMotionAt = Date()
+            if !isLiveTracking { startLiveTracking() }
+        } else {
+            // Stationary. Debounce the auto-stop so a brief pause
+            // doesn't tear down the workout session.
+            let sinceLast = lastMotionAt.map { Date().timeIntervalSince($0) } ?? 0
+            if isLiveTracking, sinceLast >= Self.autoStopStationaryInterval {
+                stopLiveTracking()
+            }
         }
     }
 
@@ -165,15 +304,28 @@ final class WatchLocationService: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Live tracking (extended runtime)
+    // MARK: - Live tracking (HealthKit workout session, with runtime-session fallback)
 
+    /// Starts Live tracking. Tries to host the session as an
+    /// `HKWorkoutSession` (effectively unlimited runtime on the
+    /// watch). If HealthKit isn't authorised yet, requests it; if the
+    /// user denies or HealthKit is unavailable, falls back to the
+    /// classic `WKExtendedRuntimeSession` (1-3 hour ceiling).
+    ///
+    /// **Why a workout session?** `WKExtendedRuntimeSession` chains
+    /// only ~2-4 hours of total runtime per day before the OS refuses
+    /// to start a new one and silently suspends the app —
+    /// observed in the field by users who left Start Live on while
+    /// the watch was on their wrist for a full afternoon.
+    /// `HKWorkoutSession` is the API Apple actually intends for
+    /// hours-long GPS sessions, and it has no equivalent budget cap
+    /// for the duration of the session.
+    ///
+    /// We use `.other` activity type because MapMe isn't a fitness
+    /// app — we don't want to credit fake exercise minutes against
+    /// the user's Activity rings. The workout sample is discarded on
+    /// stop (`discardWorkout()`), so nothing lands in the Health app.
     func startLiveTracking() {
-        // Note: the old design refused Live tracking in Battery mode
-        // (because Battery was SLC-only, with no continuous GPS). The
-        // PowerProfile redesign keeps GPS on across every profile, so
-        // Live tracking now works in any mode — Battery just samples
-        // sparsely (500 m distance filter, 5-min coalesce). No guard
-        // needed.
         // Skip `CLLocationManager.locationServicesEnabled()` — watchOS 10+
         // flags that static call as a UI-responsiveness hazard. If services
         // are disabled system-wide we'll get `.denied` here or a
@@ -189,12 +341,91 @@ final class WatchLocationService: NSObject, ObservableObject {
             return
         }
         consentRequired = false
+
+        // Bring up the host session (workout or runtime) FIRST so the
+        // app has runtime budget before we start streaming CL fixes.
+        // Both paths mark `isLiveTracking = true` and call
+        // `beginStreaming()`.
+        if HKHealthStore.isHealthDataAvailable() {
+            // Ask for an *empty* share/read set — `HKWorkoutSession`
+            // requires authorization to have happened, but we don't
+            // actually want any types. An empty share set is treated
+            // as "no access requested," which is exactly right since
+            // we never read or write samples.
+            healthStore.requestAuthorization(toShare: [HKObjectType.workoutType()],
+                                             read: []) { [weak self] granted, _ in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if granted {
+                        self.startWorkoutSession()
+                    } else {
+                        self.startRuntimeSessionFallback()
+                    }
+                }
+            }
+        } else {
+            // No HealthKit on this device (shouldn't happen on a
+            // modern Apple Watch, but the simulator can land here).
+            startRuntimeSessionFallback()
+        }
+    }
+
+    /// HealthKit-backed path. Creates an `HKWorkoutSession` of
+    /// `.other` activity type, attaches a live workout builder
+    /// (required for the session to be valid), and starts the session
+    /// + builder. On success, calls `beginStreaming()`.
+    private func startWorkoutSession() {
+        guard workoutSession == nil else { return }
+        let config = HKWorkoutConfiguration()
+        config.activityType = .other
+        config.locationType = .outdoor
+        do {
+            let session = try HKWorkoutSession(healthStore: healthStore,
+                                               configuration: config)
+            let builder = session.associatedWorkoutBuilder()
+            builder.dataSource = HKLiveWorkoutDataSource(
+                healthStore: healthStore,
+                workoutConfiguration: config
+            )
+            session.delegate = self
+            builder.delegate = self
+            workoutSession = session
+            workoutBuilder = builder
+            let start = Date()
+            session.startActivity(with: start)
+            builder.beginCollection(withStart: start) { _, _ in
+                // Collection-start failures are non-fatal — the
+                // session itself drives the runtime budget; the
+                // builder is just plumbing. We ignore the error.
+            }
+            beginStreaming()
+        } catch {
+            // Workout-session start failed (HealthKit unavailable
+            // mid-flight, or denied by Screen Time / corporate
+            // policy). Fall back to the runtime-session path.
+            trackingError = nil
+            startRuntimeSessionFallback()
+        }
+    }
+
+    /// Pre-HealthKit fallback path. Same behaviour as before — the
+    /// app gets ~1-3 hours of runtime, then watchOS suspends it. We
+    /// keep this path so users who deny HealthKit can still use Live
+    /// tracking for short trips.
+    private func startRuntimeSessionFallback() {
         if runtimeSession == nil {
             let session = WKExtendedRuntimeSession()
             session.delegate = self
             session.start()
             runtimeSession = session
         }
+        beginStreaming()
+    }
+
+    /// Common path: enable background CL + start streaming. Called
+    /// after EITHER `HKWorkoutSession` OR `WKExtendedRuntimeSession`
+    /// is up so the host always exists before CL produces fixes.
+    private func beginStreaming() {
         // Enabling background updates here (rather than in init) is what
         // requires `UIBackgroundModes = [location]` in the watch plist.
         // CL asserts at this point if the plist key is missing.
@@ -208,8 +439,27 @@ final class WatchLocationService: NSObject, ObservableObject {
     func stopLiveTracking() {
         manager.stopUpdatingLocation()
         manager.allowsBackgroundLocationUpdates = false
+
+        // Tear down whichever host is active. Both paths are nilled
+        // out at the bottom regardless so a Stop after the host was
+        // already invalidated (session denial, OS reclamation) is a
+        // safe no-op.
+        if let session = workoutSession {
+            // Per-Apple guidance: end the builder's collection first,
+            // then end the session, then DISCARD the workout (we
+            // never save samples — the workout was purely a runtime
+            // container, not exercise data we want in the user's
+            // Health app).
+            workoutBuilder?.endCollection(withEnd: Date()) { [weak self] _, _ in
+                self?.workoutBuilder?.discardWorkout()
+            }
+            session.end()
+        }
         runtimeSession?.invalidate()
+        workoutSession = nil
+        workoutBuilder = nil
         runtimeSession = nil
+
         isLiveTracking = false
         mirrorStatusToAppGroup()
     }
@@ -237,6 +487,82 @@ final class WatchLocationService: NSObject, ObservableObject {
             stopLiveTracking()
         }
         mirrorStatusToAppGroup()
+        // Arm if tracking is now eligible; the method cancels itself when
+        // consent is revoked or authorization is missing.
+        armTrackingWatchdog()
+    }
+
+    // MARK: - Tracking-paused watchdog
+
+    private func requestNotificationAuthorization() {
+        UNUserNotificationCenter.current()
+            .requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    /// (Re)schedules the watchdog notification `watchdogInterval` from now,
+    /// replacing any previously-armed one. A steady stream of fixes keeps
+    /// pushing the fire time forward so it never delivers; when fixes stop
+    /// (power-off, suspended refresh) the last-armed one fires on schedule —
+    /// even though the app is no longer running, because it was handed to the
+    /// system in advance. Only arms when the feature is on, consent is
+    /// granted, and we're authorized — i.e. tracking is *meant* to be running.
+    func armTrackingWatchdog() {
+        guard pauseAlertEnabled, isAuthorized, isConsentGranted() else {
+            cancelTrackingWatchdog()
+            return
+        }
+        let content = UNMutableNotificationContent()
+        content.title = "MapMe tracking paused"
+        content.body = "No location update in a while. Open MapMe to resume tracking."
+        content.sound = .default
+        let trigger = UNTimeIntervalNotificationTrigger(
+            timeInterval: Self.watchdogInterval,
+            repeats: false
+        )
+        let request = UNNotificationRequest(
+            identifier: Self.watchdogNotificationID,
+            content: content,
+            trigger: trigger
+        )
+        let center = UNUserNotificationCenter.current()
+        center.removePendingNotificationRequests(withIdentifiers: [Self.watchdogNotificationID])
+        center.add(request)
+    }
+
+    func cancelTrackingWatchdog() {
+        UNUserNotificationCenter.current()
+            .removePendingNotificationRequests(withIdentifiers: [Self.watchdogNotificationID])
+    }
+
+    /// Fires the watchdog alert immediately. Used by the "Test alert"
+    /// button in `WatchSettingsView` so the user can verify the
+    /// notification permission was granted and the watch is set up to
+    /// deliver the alert, without having to wait for the
+    /// `watchdogInterval` to elapse. Always requests authorization
+    /// first — the toggle's didSet does too, but a user who skipped
+    /// the prompt then tapped Test should still get a fresh chance.
+    func fireTestPauseAlert(completion: @escaping (_ delivered: Bool, _ reason: String?) -> Void) {
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound]) { granted, error in
+            guard granted else {
+                completion(false, error?.localizedDescription
+                           ?? "Notifications are off for MapMe in Settings → MapMe → Notifications.")
+                return
+            }
+            let content = UNMutableNotificationContent()
+            content.title = "MapMe tracking paused (test)"
+            content.body = "If you see this on your watch, the real alert will fire when tracking actually pauses."
+            content.sound = .default
+            // No trigger → deliver immediately.
+            let request = UNNotificationRequest(
+                identifier: "com.mapme.tracking-watchdog.test",
+                content: content,
+                trigger: nil
+            )
+            center.add(request) { err in
+                completion(err == nil, err?.localizedDescription)
+            }
+        }
     }
 
     private func observeRemoteChanges() {
@@ -286,6 +612,26 @@ final class WatchLocationService: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - Stationary cluster helpers
+
+    /// Centroid of the rolling window, or `nil` until we've
+    /// accumulated at least 3 fixes — with fewer samples any single
+    /// noisy fix dominates and the check misfires in either direction.
+    private func clusterCentroid() -> CLLocation? {
+        guard recentAcceptedFixes.count >= 3 else { return nil }
+        let n = Double(recentAcceptedFixes.count)
+        let lat = recentAcceptedFixes.map(\.coordinate.latitude).reduce(0, +) / n
+        let lon = recentAcceptedFixes.map(\.coordinate.longitude).reduce(0, +) / n
+        return CLLocation(latitude: lat, longitude: lon)
+    }
+
+    private func appendToClusterWindow(_ location: CLLocation) {
+        recentAcceptedFixes.append(location)
+        if recentAcceptedFixes.count > Self.stationaryClusterWindow {
+            recentAcceptedFixes.removeFirst(recentAcceptedFixes.count - Self.stationaryClusterWindow)
+        }
+    }
+
     // MARK: - Persistence
 
     private func persist(_ location: CLLocation) {
@@ -327,7 +673,18 @@ final class WatchLocationService: NSObject, ObservableObject {
         let minInterval = adaptive.isEnabled
             ? adaptive.interval(forSpeedKmh: speedKmh)
             : powerProfile.minimumWriteIntervalSeconds
-        if let last = lastWriteAt,
+
+        // Distance-based cadence bypass — mirror of the iOS twin.
+        // Slow movement that takes longer than the cadence interval
+        // (parking lots, hallway walking) would otherwise be
+        // coalesced into entry/exit-only fixes and the trail
+        // vanishes.
+        let displacementSinceLastAccept = lastAcceptedLocation
+            .map { location.distance(from: $0) } ?? .infinity
+        let bypassCadence = displacementSinceLastAccept >= Self.cadenceBypassMeters
+
+        if !bypassCadence,
+           let last = lastWriteAt,
            now.timeIntervalSince(last) < minInterval {
             return
         }
@@ -351,8 +708,28 @@ final class WatchLocationService: NSObject, ObservableObject {
             }
         }
 
+        // ── 4. Stationary cluster suppression ──────────────────────
+        //
+        // Watch GPS drifts 10–25 m per fix while stationary — far
+        // more than iPhone in the same conditions. The pair-wise
+        // jitter filter above catches consecutive-fix noise, but
+        // not the case where each new fix jumps 15 m in a new
+        // direction (still passes the >8 m gate but never actually
+        // leaves the rest cluster). Comparing to the centroid of the
+        // last few writes exposes the orbit and rejects the fix.
+        if speedKmh < Self.stationarySpeedKmh,
+           let centroid = clusterCentroid(),
+           location.distance(from: centroid) < Self.stationaryClusterRadiusMeters {
+            return
+        }
+
         lastWriteAt = now
         lastAcceptedLocation = location
+        appendToClusterWindow(location)
+
+        // A fix landed → tracking is alive. Push the "paused" watchdog
+        // forward so it only fires if fixes actually stop coming.
+        armTrackingWatchdog()
 
         let liveSnapshot = isLiveTracking
         let ctx = persistence.newBackgroundContext()
@@ -498,4 +875,64 @@ extension WatchLocationService: WKExtendedRuntimeSessionDelegate {
             }
         }
     }
+}
+
+// MARK: - HKWorkoutSessionDelegate
+
+extension WatchLocationService: HKWorkoutSessionDelegate {
+    nonisolated func workoutSession(
+        _ workoutSession: HKWorkoutSession,
+        didChangeTo toState: HKWorkoutSessionState,
+        from fromState: HKWorkoutSessionState,
+        date: Date
+    ) {
+        // We don't need to react to .running / .paused transitions —
+        // the workout session is just hosting our CL streaming. We DO
+        // want to clear our reference when the session ends so a
+        // later Start Live can spin up a fresh one.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            switch toState {
+            case .ended, .stopped:
+                if self.workoutSession === workoutSession {
+                    self.workoutSession = nil
+                    self.workoutBuilder = nil
+                }
+            default:
+                break
+            }
+        }
+    }
+
+    nonisolated func workoutSession(
+        _ workoutSession: HKWorkoutSession,
+        didFailWithError error: Error
+    ) {
+        // Session start/run failed mid-flight. Drop our reference and,
+        // if Live is still meant to be on, fall back to the runtime
+        // session. CL keeps streaming via
+        // `allowsBackgroundLocationUpdates` either way.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if self.workoutSession === workoutSession {
+                self.workoutSession = nil
+                self.workoutBuilder = nil
+            }
+            if self.isLiveTracking, self.runtimeSession == nil {
+                self.startRuntimeSessionFallback()
+            }
+        }
+    }
+}
+
+// MARK: - HKLiveWorkoutBuilderDelegate
+
+extension WatchLocationService: HKLiveWorkoutBuilderDelegate {
+    // We don't actually collect any health samples — the builder
+    // exists purely because `HKWorkoutSession` requires one. Both
+    // delegate callbacks are intentional no-ops; the workout will be
+    // discarded (not saved) by `stopLiveTracking()`.
+    nonisolated func workoutBuilder(_ workoutBuilder: HKLiveWorkoutBuilder,
+                                    didCollectDataOf collectedTypes: Set<HKSampleType>) {}
+    nonisolated func workoutBuilderDidCollectEvent(_ workoutBuilder: HKLiveWorkoutBuilder) {}
 }

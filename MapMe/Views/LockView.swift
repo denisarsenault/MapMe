@@ -1,4 +1,7 @@
 import SwiftUI
+#if os(macOS)
+import AppKit
+#endif
 
 struct LockView: View {
     @EnvironmentObject private var auth: AuthService
@@ -24,22 +27,23 @@ struct LockView: View {
             //            window, the wordmark reads as a compact brand
             //            badge above the lock state
             #if os(tvOS)
-            Image("MMBrandMark")
-                .resizable()
-                .scaledToFit()
-                .frame(width: 130, height: 130)
+            // Full wordmark on tvOS so "MapMe" reads clearly across
+            // the room — the pin-only MMBrandMark used to leave the
+            // brand name off the TV entirely. Forced dark variant
+            // (white text) because the tvOS lock background is
+            // always dark regardless of the user's system theme.
+            MapMeBrandImage(forced: .dark)
+                .frame(width: 480)
             #elseif os(macOS)
-            Image("MMBrandMark")
-                .resizable()
-                .scaledToFit()
-                .frame(width: 120, height: 120)
+            // macOS: full wordmark, adaptive light/dark.
+            MapMeBrandImage()
+                .frame(width: 280)
             #else
-            Image("MMLogo")
-                .resizable()
-                .scaledToFit()
-                .frame(width: 64, height: 64)
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .shadow(color: Color.black.opacity(0.15), radius: 6, y: 3)
+            // iOS: full wordmark, adaptive light/dark. Width-only
+            // frame keeps the natural 10:3 aspect — never width +
+            // height, which would squash it.
+            MapMeBrandImage()
+                .frame(width: 240)
             #endif
 
             Image(systemName: "lock.shield")
@@ -90,22 +94,50 @@ struct LockView: View {
             }
         }
         .padding()
-        // tvOS-only top inset. The default centred alignment puts the
-        // 130 pt brand mark close to the top edge of the safe area,
-        // which on a TV reads as "tucked under the system chrome".
-        // Push the whole column down a fixed amount and top-align it
-        // instead. iOS / macOS keep the centred layout — the column
-        // there fits a phone / window comfortably without an inset.
+        // Top-aligned across every non-watch platform. Centred
+        // alignment used to leave the logo + headline hovering in
+        // dead space and the PIN field roughly at thumb-rest on a
+        // phone, but on landing the user is looking at the TOP of
+        // the screen — that's where the brand and the PIN entry
+        // should be. tvOS keeps a fixed inset so the column clears
+        // the system chrome; iOS / macOS use safe-area padding
+        // alone since their chrome is much thinner.
         #if os(tvOS)
         .padding(.top, 120)
         .frame(maxWidth: Self.maxContentWidth)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         #else
         .frame(maxWidth: Self.maxContentWidth)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         #endif
         .onAppear { focused = true }
+        #if os(macOS)
+        // The 900 × 720 main-app window is way too much real estate
+        // for a sign-in column. Resize the host NSWindow down to a
+        // compact sheet-style size while LockView is on screen, then
+        // expand back to the main-app default once the user unlocks.
+        .onAppear { Self.resizeWindow(to: Self.macLockSize) }
+        .onDisappear { Self.resizeWindow(to: Self.macMainSize) }
+        #endif
     }
+
+    #if os(macOS)
+    private static let macLockSize  = NSSize(width: 460, height: 560)
+    private static let macMainSize  = NSSize(width: 900, height: 720)
+
+    /// Resizes the key window in place, anchoring its top-left so the
+    /// resize doesn't visually slide the window across the screen.
+    private static func resizeWindow(to target: NSSize) {
+        guard let window = NSApp.windows.first(where: {
+            $0.isVisible && $0.styleMask.contains(.titled)
+        }) else { return }
+        var frame = window.frame
+        let topY = frame.maxY
+        frame.size = target
+        frame.origin.y = topY - target.height
+        window.setFrame(frame, display: true, animate: true)
+    }
+    #endif
 
     // MARK: - Platform sizing
 

@@ -25,6 +25,7 @@ struct HistoryListView: View {
                 }
             }
             .navigationTitle("History")
+            .mapMeBrandToolbar()
             .navigationDestination(for: NSManagedObjectID.self) { id in
                 DayDetailView(archiveID: id)
             }

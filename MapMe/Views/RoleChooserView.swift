@@ -5,16 +5,11 @@ struct RoleChooserView: View {
 
     var body: some View {
         VStack(spacing: 24) {
-            // Brand mark. Replaces the generic SF Symbol placeholder
-            // we shipped during early prototyping — first-run feels
-            // properly branded and reinforces the app identity before
-            // the user has even chosen Guardian vs tracked-device.
-            Image("MMLogo")
-                .resizable()
-                .scaledToFit()
-                .frame(width: 96, height: 96)
-                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                .shadow(color: Color.black.opacity(0.15), radius: 8, y: 4)
+            // Adaptive 10:3 wordmark — width-only frame preserves
+            // aspect; the variant (white/black text) is chosen from
+            // the current colour scheme.
+            MapMeBrandImage()
+                .frame(width: 260)
             Text("Set up MapMe")
                 .font(.title2.weight(.semibold))
             Text("Pick how this device will be used.")

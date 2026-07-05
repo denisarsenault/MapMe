@@ -47,6 +47,14 @@ struct AppleTVGuardianDashboardView: View {
     /// false so a fresh launch can't strand the user inside a panning
     /// Map with no obvious way out.
     @State private var mapInteractive: Bool = false
+    /// Drives explicit focus placement when pan mode exits. The
+    /// `exitMapOverlay` disappearing under focus leaves the focus
+    /// engine with nothing to land on (the chromeLayer just appeared
+    /// and isn't focused yet), so the user sees the controls but
+    /// can't navigate them. We bind this to the Pan Map button — the
+    /// natural "you came from here" anchor — and set it on every
+    /// transition from `true` → `false`.
+    @FocusState private var panMapButtonFocused: Bool
     /// Persisted "user has seen the navigation tutorial" flag. The
     /// first-launch help overlay shows when this is false; the user
     /// can dismiss it for good with the Got it button, or reopen via
@@ -57,6 +65,23 @@ struct AppleTVGuardianDashboardView: View {
     /// time. We seed it to !helpDismissed in `.onAppear` so a fresh
     /// install lands the user on the tutorial automatically.
     @State private var helpVisible: Bool = false
+    /// Settings sheet visibility. tvOS previously had no path into
+    /// `SettingsView` from this dashboard — Guardian users had to go
+    /// back through the role chooser to change any app preference.
+    /// This adds a Settings button in the top bar's second row that
+    /// presents `SettingsView` as a full-screen sheet.
+    @State private var settingsVisible: Bool = false
+    /// Map base style picker. `WorldMapView` applies the matching
+    /// `MapKit.MapStyle`. tvOS has no built-in style switcher, so
+    /// we surface Standard / Satellite / Hybrid as top-bar buttons.
+    @State private var mapStyle: WorldMapStyle = .standard
+    /// Pulse counters wired to Zoom In / Zoom Out buttons. tvOS has
+    /// no pinch gesture, so the dashboard exposes these as explicit
+    /// chrome controls. Each tap bumps the matching pulse; the
+    /// `WorldMapView` watches via `.onChange` and adjusts its
+    /// `MapCameraPosition` span accordingly.
+    @State private var zoomInPulse: Int = 0
+    @State private var zoomOutPulse: Int = 0
     @ObservedObject private var snapService = SnapToRoadsService.shared
 
     var body: some View {
@@ -86,21 +111,52 @@ struct AppleTVGuardianDashboardView: View {
             // Play/Pause to escape back to the focus-engine controls.
             mapInteractive.toggle()
         }
+        // Menu/Back is the tvOS-canonical "go back / get me out" gesture.
+        // Wire it as a third exit so users who don't know Play/Pause is
+        // overloaded — and can't reach the Done button because the Map
+        // is eating their swipes — always have a way home.
+        //
+        // Only intercept while we're IN pan mode; otherwise let the
+        // system's default Menu behaviour (back to home screen) run.
+        .onExitCommand {
+            if mapInteractive { mapInteractive = false }
+        }
         .task { await guardianSync.ensureSubscription() }
         .onReceive(NotificationCenter.default
             .publisher(for: .NSPersistentStoreRemoteChange)
             .receive(on: DispatchQueue.main)
         ) { _ in
+            // Refresh on EVERY remote-change so a fresh fix from a
+            // Minor device paints even in Date mode (the previous
+            // `guard liveMode` filter left Date-mode maps stale until
+            // the user Clicked something). The @FetchRequest's date-
+            // range predicate filters out records outside the visible
+            // window, so this is cheap when nothing changed on screen.
+            //
             // `.receive(on: DispatchQueue.main)` marshals CloudKit's
             // background-thread notification onto main before we
             // touch viewContext / cascade into @Published state.
-            guard liveMode else { return }
             PersistenceController.shared.container.viewContext.refreshAllObjects()
         }
         .onChange(of: mapSelection) { _, newValue in
             if let id = newValue {
                 selectedProfileIDs = [id]
             }
+        }
+        // Restore focus to the Pan Map button after pan mode exits.
+        // Without this, the focus engine has no anchor on the freshly
+        // re-appeared chromeLayer and the user can navigate to the
+        // controls visually but nothing accepts Click. A tiny
+        // delay lets SwiftUI mount the chrome before we steal focus.
+        .onChange(of: mapInteractive) { _, isInteractive in
+            guard !isInteractive else { return }
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(80))
+                panMapButtonFocused = true
+            }
+        }
+        .sheet(isPresented: $settingsVisible) {
+            SettingsView()
         }
     }
 
@@ -127,7 +183,10 @@ struct AppleTVGuardianDashboardView: View {
                 liveMode: liveMode,
                 snapToRoads: snapService.isEnabled,
                 colors: colorMap,
-                mapSelection: $mapSelection
+                mapSelection: $mapSelection,
+                style: mapStyle,
+                zoomInPulse: zoomInPulse,
+                zoomOutPulse: zoomOutPulse
             )
             .ignoresSafeArea()
             // Hit testing gated by `mapInteractive` so the Map only
@@ -150,23 +209,48 @@ struct AppleTVGuardianDashboardView: View {
         }
     }
 
-    /// Floating "Done" button shown only while in Map mode. It's the
-    /// single focusable element above the panning Map, so a swipe-up
-    /// from the map naturally lands on it.
+    /// Floating "exit pan mode" affordance shown only while in Map
+    /// mode. Three exits in priority order:
+    ///
+    ///   1. The focusable **Done** button — swipe-up from the panning
+    ///      map lands here (it's the only focusable element above the
+    ///      map while in this mode).
+    ///   2. **Play/Pause** on the Siri Remote — `.onPlayPauseCommand`
+    ///      on the root view.
+    ///   3. **Menu/Back** on the Siri Remote — `.onExitCommand` on
+    ///      the root view.
+    ///
+    /// We surface (2) and (3) as small caption lines beneath Done so
+    /// a user who can't get focus off the map (because pan gestures
+    /// are being absorbed by the Map view) sees the remote-button
+    /// escapes right there, instead of having to remember they were
+    /// listed in the help modal at first launch.
     private var exitMapOverlay: some View {
         VStack {
             HStack {
                 Spacer()
-                Button {
-                    mapInteractive = false
-                } label: {
-                    Label("Done", systemImage: "checkmark.circle.fill")
-                        .font(.title3.weight(.semibold))
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 8)
+                VStack(alignment: .trailing, spacing: 8) {
+                    Button {
+                        mapInteractive = false
+                    } label: {
+                        Label("Done", systemImage: "checkmark.circle.fill")
+                            .font(.title3.weight(.semibold))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.green)
+
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Label("or press Play/Pause", systemImage: "playpause.fill")
+                        Label("or press Menu / Back", systemImage: "arrow.uturn.backward")
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.85))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.green)
                 .padding(.trailing, 60)
                 .padding(.top, 60)
             }
@@ -191,19 +275,85 @@ struct AppleTVGuardianDashboardView: View {
     ///    when they'd be no-ops (instead of just disabling) so the
     ///    bar collapses back to "◀ Date" when there's nothing to skip
     ///    forward to.
+    /// Two-row top bar. Splits the chrome along a clean mental
+    /// boundary so neither row feels crowded once focus inflates
+    /// a button:
+    ///
+    ///   - **Row 1 (the "when" row):** brand + date stepper + Live/Snap
+    ///     mode toggles. These say *what slice of data* the map is
+    ///     showing.
+    ///   - **Row 2 (the "how" row):** Zoom −/+, Map style cycle,
+    ///     Pan map, Help. These say *how* the map is being rendered
+    ///     and navigated.
+    ///
+    /// Each row is wrapped in `.focusSection()` so Siri Remote
+    /// swipe-up / swipe-down naturally moves focus between the two
+    /// rows rather than getting confused mid-row.
     private var topBar: some View {
-        HStack(spacing: 18) {
-            brandMark
-            dateControlsGroup
-            modeToggleGroup
-            Spacer(minLength: 12)
-            helpButton
-            panMapButton
+        VStack(spacing: 8) {
+            // Row 1: brand mark centred, with the "what slice of
+            // data" controls flanking it — date stepper on the left,
+            // Live/Snap toggles on the right. Flexible spacers on
+            // both sides of the brand keep it visually anchored to
+            // the centre of the screen regardless of how many
+            // conditional date buttons (▶ / Today) are showing.
+            HStack(spacing: 18) {
+                dateControlsGroup
+                Spacer(minLength: 24)
+                brandMark
+                Spacer(minLength: 24)
+                modeToggleGroup
+            }
+            .focusSection()
+
+            HStack(spacing: 12) {
+                mapToolsGroup
+                Spacer(minLength: 12)
+                settingsButton
+                helpButton
+                panMapButton
+            }
+            .focusSection()
         }
         .padding(.horizontal, 36)
         .padding(.vertical, 10)
         .frame(maxWidth: .infinity)
         .background(.regularMaterial)
+    }
+
+    /// Zoom In / Zoom Out + Map Style cycle. tvOS has no pinch and
+    /// no built-in map-style picker, so these surface as explicit
+    /// buttons in the top bar. The style button cycles through
+    /// Standard → Satellite → Hybrid → Standard on each click so
+    /// it stays in the same compact footprint as the other
+    /// `.bordered` buttons (a segmented picker would be much wider
+    /// and dominate the bar).
+    private var mapToolsGroup: some View {
+        HStack(spacing: 10) {
+            Button {
+                zoomInPulse &+= 1
+            } label: {
+                Image(systemName: "plus.magnifyingglass")
+                    .font(.callout)
+            }
+            .buttonStyle(.bordered)
+
+            Button {
+                zoomOutPulse &+= 1
+            } label: {
+                Image(systemName: "minus.magnifyingglass")
+                    .font(.callout)
+            }
+            .buttonStyle(.bordered)
+
+            Button {
+                mapStyle = mapStyle.next
+            } label: {
+                Label(mapStyle.label, systemImage: mapStyle.icon)
+                    .font(.callout)
+            }
+            .buttonStyle(.bordered)
+        }
     }
 
     /// Non-focusable logo + wordmark on the leading edge of the top
@@ -307,15 +457,26 @@ struct AppleTVGuardianDashboardView: View {
         }
     }
 
-    /// Help (?) button. Re-opens the navigation tutorial overlay
-    /// even after the user has dismissed it once. Icon-only to keep
-    /// it small — focus state still inflates it but it doesn't
-    /// crowd the bar.
+    /// Help (?) button. Opens the full-screen tutorial overlay
+    /// even after the user has dismissed it once.
     private var helpButton: some View {
         Button {
             helpVisible = true
         } label: {
             Image(systemName: "questionmark.circle")
+                .font(.callout)
+        }
+        .buttonStyle(.bordered)
+    }
+
+    /// Settings button. Presents `SettingsView` as a full-screen
+    /// sheet — role/security/data controls that used to be
+    /// unreachable from the tvOS Guardian dashboard entirely.
+    private var settingsButton: some View {
+        Button {
+            settingsVisible = true
+        } label: {
+            Image(systemName: "gearshape")
                 .font(.callout)
         }
         .buttonStyle(.bordered)
@@ -336,6 +497,7 @@ struct AppleTVGuardianDashboardView: View {
                 .foregroundStyle(.blue)
         }
         .buttonStyle(.bordered)
+        .focused($panMapButtonFocused)
     }
 
     // MARK: - Device cards
@@ -530,15 +692,27 @@ struct AppleTVGuardianDashboardView: View {
                     helpRow(icon: "dot.radiowaves.right",
                             title: "Live mode",
                             detail: "Shows the last 24 hours with a pulsing pin on each device's latest fix.")
+                    helpRow(icon: "road.lanes",
+                            title: "Snap to roads",
+                            detail: "Routes the trail along real roads via MKDirections so the line follows pavement instead of cutting across blocks.")
+                    helpRow(icon: "plus.magnifyingglass",
+                            title: "Zoom in / Zoom out",
+                            detail: "Apple TV has no pinch gesture, so use the + and − magnifier buttons in the top bar to step the map closer or farther.")
+                    helpRow(icon: "map",
+                            title: "Map style",
+                            detail: "Cycles through Standard, Satellite, and Hybrid (imagery + labels). Click the style button to advance.")
                     helpRow(icon: "hand.draw.fill",
                             title: "Pan map",
-                            detail: "Hands the Siri Remote to the map so you can swipe to pan and click to zoom. Press Play/Pause anytime as a shortcut.")
+                            detail: "Hands the Siri Remote to the map so you can swipe to pan. Press Play/Pause anytime as a shortcut.")
                     helpRow(icon: "checkmark.circle.fill",
                             title: "Done (top-right while panning)",
                             detail: "Returns control to the buttons. Play/Pause does the same thing.")
                     helpRow(icon: "person.2.fill",
-                            title: "Tap a device card",
-                            detail: "Filters the map to that one device. Tap All devices to show everyone again.")
+                            title: "Click a device card",
+                            detail: "Filters the map to that one device. Click All devices to show everyone again.")
+                    helpRow(icon: "gearshape",
+                            title: "Settings",
+                            detail: "The gear icon in the second row of the top bar opens Settings — role, security, Family alerts, versions.")
                 }
 
                 HStack {

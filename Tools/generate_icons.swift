@@ -434,15 +434,41 @@ func writeAppIcons() {
 let wordmarkBlueTop  = NSColor(red: 0.30, green: 0.66, blue: 1.00, alpha: 1.0)
 let wordmarkBlueBot  = NSColor(red: 0.10, green: 0.42, blue: 0.92, alpha: 1.0)
 
-func renderWordmark(width: Int, height: Int) -> NSBitmapImageRep {
+func renderWordmark(width: Int, height: Int, textColor: NSColor = .white) -> NSBitmapImageRep {
     let w = CGFloat(width); let h = CGFloat(height)
     let rep = makeRep(width: width, height: height)
 
     draw(into: rep) { ctx in
-        // Layout: pin on the left, wordmark on the right, vertically centred.
-        let pinAreaWidth = w * 0.26
-        let pinCx = w * 0.18
+        // Layout: pin on the left, wordmark on the right, the *pair*
+        // horizontally centred in the image. Earlier versions pinned
+        // the pin to a fixed x of 0.18·w and the text to 0.28·w, which
+        // left ~125 px of blank space on the right of a 480 px image
+        // and only ~60 px on the left — when iOS UILaunchScreen
+        // centred the bitmap on screen, the visible lockup sat
+        // noticeably left of screen centre. Measuring the text first
+        // and packing pin + gap + text as a unit lets the unit centre
+        // on the image's true horizontal centre.
         let pinRadius = h * 0.20
+        let pinWidth = 2 * pinRadius
+        let gap = w * 0.04
+
+        let fontSize = h * 0.48
+        let baseFont = NSFont.systemFont(ofSize: fontSize, weight: .bold)
+        let descriptor = baseFont.fontDescriptor.withDesign(.rounded) ?? baseFont.fontDescriptor
+        let font = NSFont(descriptor: descriptor, size: fontSize) ?? baseFont
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: textColor,
+            .kern: fontSize * -0.015,
+        ]
+        let str = NSAttributedString(string: "MapMe", attributes: attrs)
+        let stringSize = str.size()
+
+        let lockupWidth = pinWidth + gap + stringSize.width
+        let lockupLeft = (w - lockupWidth) / 2
+        let pinCx = lockupLeft + pinRadius
+        let textX = lockupLeft + pinWidth + gap
+
         let pinTipY = h * 0.5 - pinRadius * 1.45
         let pinPath = mapPinPath(cx: pinCx, tipY: pinTipY, headRadius: pinRadius)
 
@@ -467,37 +493,44 @@ func renderWordmark(width: Int, height: Int) -> NSBitmapImageRep {
                                    width: 2*holeR, height: 2*holeR))
 
         // Wordmark text — SF Rounded Bold in white.
-        let textX = pinAreaWidth + w * 0.02
-        let fontSize = h * 0.48
-        let baseFont = NSFont.systemFont(ofSize: fontSize, weight: .bold)
-        let descriptor = baseFont.fontDescriptor.withDesign(.rounded) ?? baseFont.fontDescriptor
-        let font = NSFont(descriptor: descriptor, size: fontSize) ?? baseFont
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: NSColor.white,
-            .kern: fontSize * -0.015,
-        ]
-        let str = NSAttributedString(string: "MapMe", attributes: attrs)
-        let stringSize = str.size()
         let textY = (h - stringSize.height) / 2
         str.draw(at: NSPoint(x: textX, y: textY))
     }
     return rep
 }
 
-// Writes MMLogo.imageset (universal 1x/2x/3x). Info-iOS.plist UILaunchScreen
-// references "MMLogo" by name; the in-app SplashView draws the same shape
-// directly in SwiftUI so we don't pixel-double on the seam.
-func writeMMLogo(into root: URL, baseWidth: Int = 480, baseHeight: Int = 144) {
-    let dir = root.appendingPathComponent("MMLogo.imageset")
+// Writes an MMLogo-style wordmark imageset (universal 1x/2x/3x).
+//
+// `MMLogo` (white text) is referenced by Info-iOS.plist UILaunchScreen
+// and used wherever the wordmark sits on a dark/branded background
+// (SplashView fallback, dark-mode nav bars, lock screen on dark
+// material). The in-app SplashView draws the same shape directly in
+// SwiftUI so we don't pixel-double on the launch→splash seam.
+//
+// `MMLogoLight` (black text) is the companion for white / light-mode
+// backgrounds — light-mode navigation bars, the on-light-material
+// status pill on LiveMapView, etc. Picked at runtime by the
+// `MapMeBrandImage` SwiftUI helper based on `@Environment(\.colorScheme)`.
+func writeMMLogo(
+    into root: URL,
+    assetName: String = "MMLogo",
+    textColor: NSColor = .white,
+    baseWidth: Int = 480,
+    baseHeight: Int = 144
+) {
+    let dir = root.appendingPathComponent("\(assetName).imageset")
     try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     var images: [[String: Any]] = []
     for scale in [1, 2, 3] {
         let fn = scale == 1 ? "logo@1x.png" : "logo@\(scale)x.png"
-        let rep = renderWordmark(width: baseWidth * scale, height: baseHeight * scale)
+        let rep = renderWordmark(
+            width: baseWidth * scale,
+            height: baseHeight * scale,
+            textColor: textColor
+        )
         savePNG(rep, to: dir.appendingPathComponent(fn))
         images.append(["filename": fn, "idiom": "universal", "scale": "\(scale)x"])
-        print("  MMLogo \(root.lastPathComponent)/\(fn)")
+        print("  \(assetName) \(root.lastPathComponent)/\(fn)")
     }
     writeJSON([
         "images": images,
@@ -1027,6 +1060,11 @@ writeToolbarIcons()
 print("MMLogo (wordmark) + splash colour + brand mark:")
 writeMMLogo(into: assetsRoot)
 writeMMLogo(into: watchAssetsRoot, baseWidth: 180, baseHeight: 54)
+// Black-text companion for white / light-mode backgrounds. Same
+// geometry as MMLogo; only the text colour differs. Watch app stays
+// dark-only (its window chrome is always black), so we skip the
+// MMLogoLight write there to keep the bundle smaller.
+writeMMLogo(into: assetsRoot, assetName: "MMLogoLight", textColor: .black)
 writeSplashBackgroundColor(into: assetsRoot)
 writeSplashBackgroundColor(into: watchAssetsRoot)
 writeBrandMark(into: assetsRoot)

@@ -1,14 +1,51 @@
 import SwiftUI
 import CloudKit
+import os
+import UserNotifications
 #if canImport(BackgroundTasks)
 import BackgroundTasks
-#endif
+#endif 
 #if canImport(UIKit)
 import UIKit
 #endif
 #if canImport(AppKit)
 import AppKit
 #endif
+
+/// Subsystem-shared logger for the share-accept path. Filter in
+/// Console.app by subsystem `com.mybrightzone.app` + category
+/// `sharing` to see only these messages.
+private let shareLog = Logger(subsystem: "com.mybrightzone.app", category: "sharing")
+
+
+/// Posts a local notification (already-authorized cases only) so the
+/// Guardian gets a visible "couldn't accept invite" message when
+/// `acceptShare` throws. Without this, a failed cold-launch accept
+/// just silently logs and the user thinks "tapping the link did
+/// nothing."
+///
+/// tvOS doesn't surface alert-style notifications — the OS marks
+/// `UNMutableNotificationContent.title`/`.body`/`.sound` as unavailable
+/// there. We still want the accept handler to RUN on tvOS (Apple TV
+/// can be a Guardian dashboard), so this function is a no-op on
+/// tvOS; the error is already logged via `shareLog` on every
+/// platform.
+private func notifyShareAcceptFailure(_ error: Error) {
+    #if os(tvOS)
+    _ = error
+    #else
+    let content = UNMutableNotificationContent()
+    content.title = "MapMe couldn't accept the invite"
+    content.body = error.localizedDescription
+    content.sound = .default
+    let request = UNNotificationRequest(
+        identifier: "com.mapme.share-accept-failed",
+        content: content,
+        trigger: nil
+    )
+    UNUserNotificationCenter.current().add(request)
+    #endif
+}
 
 @main
 struct MapMeApp: App {
@@ -37,6 +74,12 @@ struct MapMeApp: App {
         #if os(iOS)
         BackgroundTaskScheduler.register()
         #endif
+        // Touch the Guardian audio-alert service singleton so its
+        // remote-change observer registers now if the user has the
+        // "audio alert on motion" toggle on. On non-Guardian devices
+        // this is a cheap no-op — the service short-circuits when
+        // `isEnabled` is false.
+        _ = GuardianAudioAlertService.shared
     }
 
     var body: some Scene {
@@ -62,7 +105,7 @@ struct MapMeApp: App {
                         }
                 }
             }
-                .onChange(of: scenePhase) { _, phase in handleScenePhase(phase) }
+            .onChange(of: scenePhase) { _, phase in handleScenePhase(phase) }
                 .task {
                     if roleStore.role == .guardian {
                         await guardianSync.ensureSubscription()
@@ -93,6 +136,23 @@ struct MapMeApp: App {
         #if os(macOS)
         .defaultSize(width: 900, height: 720)
         .windowResizability(.contentMinSize)
+        #endif
+
+        // macOS-native Settings scene: adds a "Settings…" entry under
+        // the app menu with the ⌘, shortcut. Independent of the
+        // dashboard toolbar's Settings button (which can be pushed
+        // into the toolbar overflow on narrow windows), so a user
+        // running with a small window still has a reliable path to
+        // Settings.
+        #if os(macOS)
+        Settings {
+            SettingsView()
+                .environmentObject(auth)
+                .environmentObject(roleStore)
+                .environmentObject(guardianSync)
+                .environment(\.managedObjectContext, persistence.container.viewContext)
+                .frame(minWidth: 480, minHeight: 420)
+        }
         #endif
     }
 
@@ -130,12 +190,13 @@ final class MapMeAppDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication,
                      userDidAcceptCloudKitShareWith metadata: CKShare.Metadata) {
         Task { @MainActor in
+            shareLog.notice("userDidAcceptCloudKitShareWith fired (share: \(metadata.share.recordID.recordName, privacy: .public))")
             do {
                 try await SharingService().acceptShare(metadata: metadata)
+                shareLog.notice("acceptShare succeeded — Guardian should now see the new device in Family")
             } catch {
-                #if DEBUG
-                print("Failed to accept share: \(error)")
-                #endif
+                shareLog.error("acceptShare FAILED: \(error.localizedDescription, privacy: .public)")
+                notifyShareAcceptFailure(error)
             }
         }
     }
@@ -149,12 +210,13 @@ final class MapMeAppDelegate: NSObject, NSApplicationDelegate {
     func application(_ application: NSApplication,
                      userDidAcceptCloudKitShareWith metadata: CKShare.Metadata) {
         Task { @MainActor in
+            shareLog.notice("userDidAcceptCloudKitShareWith fired (share: \(metadata.share.recordID.recordName, privacy: .public))")
             do {
                 try await SharingService().acceptShare(metadata: metadata)
+                shareLog.notice("acceptShare succeeded — Guardian should now see the new device in Family")
             } catch {
-                #if DEBUG
-                print("Failed to accept share: \(error)")
-                #endif
+                shareLog.error("acceptShare FAILED: \(error.localizedDescription, privacy: .public)")
+                notifyShareAcceptFailure(error)
             }
         }
     }

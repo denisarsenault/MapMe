@@ -69,6 +69,7 @@ struct DayDetailView: View {
             .frame(maxWidth: .infinity, alignment: .center)
         }
         .navigationTitle(archive.date.map { $0.formatted(date: .abbreviated, time: .omitted) } ?? "Day")
+        .mapMeBrandToolbar()
         #if os(iOS) || os(macOS)
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
@@ -141,7 +142,12 @@ struct DayDetailView: View {
             ForEach(trips) { trip in
                 if trip.coordinates.count > 1 {
                     MapPolyline(coordinates: trip.coordinates)
-                        .stroke(.tint, lineWidth: 4)
+                        .stroke(
+                            trip.isFallback ? AnyShapeStyle(Color.accentColor.opacity(0.55)) : AnyShapeStyle(.tint),
+                            style: trip.isFallback
+                                ? StrokeStyle(lineWidth: 3, dash: [10, 6])
+                                : StrokeStyle(lineWidth: 4)
+                        )
                 }
             }
             if let start = firstCoord {

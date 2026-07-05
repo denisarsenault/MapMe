@@ -31,9 +31,6 @@ final class GuardianSyncService: ObservableObject {
             applyError(nil)
         } catch {
             applyError(error.localizedDescription)
-            #if DEBUG
-            print("Guardian subscribe failed: \(error)")
-            #endif
         }
     }
 
