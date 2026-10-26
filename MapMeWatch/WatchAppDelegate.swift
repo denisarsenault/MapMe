@@ -33,6 +33,32 @@ final class WatchAppDelegate: NSObject, WKApplicationDelegate {
         // launches us. A user opening the app is one such trigger — make sure
         // it restarts the chain.
         scheduleNextBackgroundRefresh()
+
+        // Always-on tracking: if the user has this on (default) and
+        // Live isn't currently running, kick it. This is what turns
+        // "the watch app is opened" into "the watch is now recording
+        // continuously" without the user having to tap Start on the
+        // Live tab. `ensureLiveTracking` is idempotent — it no-ops
+        // if tracking is already up, or if consent / authorization
+        // aren't ready yet.
+        Task { @MainActor in
+            WatchLocationService.shared.ensureLiveTracking()
+            // Reset the reminder-quiet-window every time the user
+            // opens MapMe on the watch — no need to nag someone
+            // who's actively here.
+            LaunchReminderService.shared.recordAppActivity()
+        }
+    }
+
+    func applicationWillResignActive() {
+        // Drain any buffered fixes now so a wrist-down → suspend cycle
+        // doesn't leave a batch stranded in memory until the next
+        // background refresh (which may be 15 min away, or never on a
+        // freshly-rebooted watch). See `WatchLocationService.flushPendingWrites`
+        // for the batching rationale.
+        Task { @MainActor in
+            WatchLocationService.shared.flushPendingWrites()
+        }
     }
 
     func handle(_ backgroundTasks: Set<WKRefreshBackgroundTask>) {
@@ -79,6 +105,23 @@ final class WatchAppDelegate: NSObject, WKApplicationDelegate {
         // The next refresh was already queued in `handle(_:)` before any task
         // was dispatched, so the chain survives even if the work below crashes.
         Task { @MainActor in
+            // Always-on: revive Live tracking on every background wake
+            // if it's supposed to be running but isn't. This is the
+            // safety net for the "watch rebooted / battery cut out /
+            // user manually started a real workout that ended MapMe's
+            // session" recovery — the next refresh cycle brings us
+            // back online without needing the user to open the app.
+            WatchLocationService.shared.ensureLiveTracking()
+
+            // Launch-reminder poll: if the user has reminders on and
+            // isn't currently tracking (persisted flag, not the
+            // in-memory bool — see LaunchReminderService for why),
+            // post a "MapMe stopped tracking" notification. The
+            // service's own cooldown prevents flooding.
+            LaunchReminderService.shared.fireMovementReminderIfNeeded(
+                isCurrentlyTracking: LaunchReminderService.isTrackingActive()
+            )
+
             WatchLocationService.shared.performBackgroundLocationFetch {
                 task.setTaskCompletedWithSnapshot(false)
             }

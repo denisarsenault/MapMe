@@ -51,6 +51,7 @@ struct WatchAdaptiveSamplingView: View {
             .padding(.horizontal, 4)
         }
         .navigationTitle("Adaptive")
+        .mapMeWatchBrand("Adaptive")
     }
 
     // MARK: - Subsections

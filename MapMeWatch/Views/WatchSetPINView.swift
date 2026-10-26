@@ -10,26 +10,34 @@ struct WatchSetPINView: View {
     enum Step { case first, confirm }
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 8) {
-                Image(systemName: "lock.rectangle.stack")
-                    .font(.title3)
-                    .foregroundStyle(.tint)
-                Text(step == .first ? "Set 4‑digit PIN" : "Confirm PIN")
-                    .font(.headline)
-                    .multilineTextAlignment(.center)
+        // Pickers outside the outer ScrollView — see WatchLockView
+        // for the "contentOffset binding has been read" rationale.
+        VStack(spacing: 8) {
+            // MMLogo instead of a generic lock SF Symbol — anchors
+            // this screen to MapMe at a glance so the wearer knows
+            // which app is asking for a PIN. Small (24 pt) so the
+            // picker row still fits above the fold on 38 mm faces.
+            Image("MMLogo")
+                .resizable()
+                .scaledToFit()
+                .frame(height: 24)
+                .accessibilityLabel("MapMe")
+            Text(step == .first ? "Set 4‑digit PIN" : "Confirm PIN")
+                .font(.headline)
+                .multilineTextAlignment(.center)
 
-                WatchPINEntry(digits: $digits)
+            WatchPINEntry(digits: $digits)
 
-                Button(step == .first ? "Next" : "Save", action: advance)
-                    .buttonStyle(.borderedProminent)
+            Button(step == .first ? "Next" : "Save", action: advance)
+                .buttonStyle(.borderedProminent)
 
+            ScrollView {
                 if let error {
                     Text(error).font(.caption2).foregroundStyle(.red)
                 }
             }
-            .padding(.vertical, 4)
         }
+        .padding(.vertical, 4)
     }
 
     private func advance() {

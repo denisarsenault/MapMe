@@ -85,10 +85,32 @@ enum PowerProfile: String, CaseIterable, Codable, Identifiable {
         }
     }
 
+    /// Whether `CLLocationManager` may pause updates when iOS thinks
+    /// the user has stopped moving.
+    ///
+    /// **Off for Balanced and HighAccuracy.** When this was on for
+    /// Balanced, a real drive with a couple of traffic-light stops
+    /// produced trails that were dense at the start, dense at the
+    /// end, and empty in the middle. Root cause: iOS pauses updates
+    /// after ~60 s of "no motion" at a light, and delivers
+    /// `locationManagerDidPauseLocationUpdates` to the app. If the
+    /// app is backgrounded at that moment (screen off, driving), it
+    /// never handles the delegate call. When the car starts moving
+    /// again, iOS DOES NOT auto-resume — updates stay paused until a
+    /// significant-location-change event (~500 m of movement) or the
+    /// user re-opens the app. Result: 500-1000 m dead zones scattered
+    /// through the trip.
+    ///
+    /// Our own `minimumWriteIntervalSeconds` (90 s at Balanced, 30 s
+    /// at HighAccuracy) already throttles the write cadence, so iOS
+    /// auto-pause was a redundant "power savings" layer that mostly
+    /// broke reliability. Battery mode keeps auto-pause on because
+    /// its whole design point is maximum stationary savings — users
+    /// on Battery accept coarser tracks in exchange.
     var pausesLocationUpdatesAutomatically: Bool {
         switch self {
-        case .battery, .balanced: return true
-        case .highAccuracy:       return false
+        case .battery:                     return true
+        case .balanced, .highAccuracy:     return false
         }
     }
 

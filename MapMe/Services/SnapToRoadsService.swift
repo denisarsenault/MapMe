@@ -47,6 +47,76 @@ private actor DirectionsRateLimiter {
     }
 }
 
+/// Deterministic 64-bit FNV-1a, used to build snap cache keys.
+///
+/// Deliberately **not** Swift's `Hasher`: that is seeded per process, so
+/// keys derived from it wouldn't match across launches and the on-disk
+/// cache would never hit. FNV-1a is stable forever, cheap (one multiply +
+/// xor per byte, no allocation), and 64 bits is far more than enough to
+/// keep collisions out of a cache that holds ≤ 128 trails.
+///
+/// Coordinates are quantized to 1e-5 degrees (~1 m) before hashing, which
+/// preserves the old keys' tolerance for numerical wobble.
+struct FNV1a {
+    private var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+    private static let prime: UInt64 = 0x0000_0100_0000_01b3
+
+    mutating func combine(_ value: Int64) {
+        var v = UInt64(bitPattern: value)
+        for _ in 0..<8 {
+            hash = (hash ^ (v & 0xff)) &* Self.prime
+            v >>= 8
+        }
+    }
+
+    /// Quantize to ~1 m and fold in. Matches the precision of the
+    /// `"%.5f"` keys this replaced.
+    mutating func combine(_ coordinate: CLLocationCoordinate2D) {
+        combine(Int64((coordinate.latitude * 100_000).rounded()))
+        combine(Int64((coordinate.longitude * 100_000).rounded()))
+    }
+
+    mutating func combine(_ fix: TimedFix) {
+        combine(fix.coordinate)
+        combine(Int64(fix.timestamp.timeIntervalSince1970))
+    }
+
+    var value: UInt64 { hash }
+
+    /// Hex form, for the `String`-keyed caches (the on-disk cache
+    /// serializes its keys as JSON object names).
+    var keyString: String { String(hash, radix: 16) }
+}
+
+/// Great-circle distance in metres between two coordinates.
+///
+/// Exists because the trip pipeline (`segmentIntoTrips`, `subsample`,
+/// `totalDisplacement`) runs on the main actor inside a SwiftUI `body`,
+/// once per profile, and previously allocated two `CLLocation` objects per
+/// fix per pass. On a Live Guardian view — 30 fps marker tweening × three
+/// passes × a few thousand fixes × N profiles — that was tens of thousands
+/// of ObjC allocations and their ARC traffic per frame, which is what made
+/// the interface feel heavy with snap on. This does the same job in
+/// registers.
+///
+/// Haversine on a spherical Earth is within ~0.3 % of `CLLocation`'s
+/// ellipsoidal result — irrelevant against thresholds of 10 m, 90 m,
+/// 200 m, 800 m and 5 km.
+@inline(__always)
+func metersBetween(_ a: CLLocationCoordinate2D,
+                   _ b: CLLocationCoordinate2D) -> CLLocationDistance {
+    let earthRadius: Double = 6_372_797.6
+    let toRad = Double.pi / 180
+    let dLat = (b.latitude - a.latitude) * toRad
+    let dLon = (b.longitude - a.longitude) * toRad
+    let lat1 = a.latitude * toRad
+    let lat2 = b.latitude * toRad
+    let sinDLat = sin(dLat / 2)
+    let sinDLon = sin(dLon / 2)
+    let h = sinDLat * sinDLat + cos(lat1) * cos(lat2) * sinDLon * sinDLon
+    return 2 * earthRadius * asin(min(1, h.squareRoot()))
+}
+
 /// Aggregate snap progress across all in-flight Tasks. Lets the UI show
 /// "snapping 12/47…" instead of a generic "working" spinner.
 struct SnapProgress: Equatable, Sendable {
@@ -171,6 +241,120 @@ final class SnapToRoadsService: ObservableObject {
     /// `@Published` so SwiftUI views re‑render when a snap completes.
     @Published private(set) var cache: [String: [SnappedChunk]] = [:]
 
+    /// Per-**segment** snap cache. Key is the (rounded) coord-pair;
+    /// value is the snapped polyline (or `.fallback` when
+    /// MKDirections legitimately couldn't route or returned a
+    /// route we rejected by stretch-ratio). Populated whenever a
+    /// segment gets its first successful snap and reused across
+    /// every subsequent whole-trip snap that walks over the same
+    /// pair.
+    ///
+    /// Why this exists: `cache` above is keyed by the FULL sequence
+    /// of subsampled coords. On the Guardian's Live view of a
+    /// device that's actively writing fixes (especially the watch,
+    /// now that we drove `distanceFilter` down to 20 m), the trip
+    /// grows by a point every 15-30 s and every append mints a new
+    /// whole-trip key → the trip-level cache never hits and the
+    /// polyline sits in the raw placeholder forever. The
+    /// segment-level cache turns each fresh whole-trip snap into
+    /// "N-1 instant hits + 1 MKDirections call for the new tail",
+    /// which typically returns fast enough that the next render
+    /// finds the new trip key populated and swaps to snapped
+    /// geometry before the wearer takes another few steps.
+    ///
+    /// Not `@Published` — mutations from `MainActor.run` after each
+    /// `compute()` completion flow through `cache`'s own change
+    /// signal, which is what actually drives the re-render.
+    private var segmentCache: [String: SegmentSnap] = [:]
+    /// Insertion timestamps for `segmentCache` LRU eviction.
+    private var segmentAddedAt: [String: Date] = [:]
+    /// In-memory cap for `segmentCache`. Each entry is a segment's
+    /// snapped polyline coords (typically 20-100 CLLocationCoord2Ds
+    /// ≈ 400 B – 2 KB). LRU-evicted past the cap. tvOS gets a much
+    /// smaller cap: the 4th-gen Apple TV (`AppleTV5,3`) runs with
+    /// ~256 MB app budget and jetsam-killed the process when the
+    /// segment + whole-trip caches accumulated under Live tracking.
+    /// 400 entries covers a couple of days of walking for a small
+    /// family and stays comfortably inside the tvOS envelope.
+    #if os(tvOS)
+    private static let maxSegmentCacheEntries = 400
+    #else
+    private static let maxSegmentCacheEntries = 2000
+    #endif
+
+    /// One segment's snap result. `.snapped(coords)` is the route
+    /// polyline returned by MKDirections. `.fallback` means either
+    /// MKDirections gave us no route at all, or the route it gave
+    /// us was rejected by the stretch-ratio guard — in both cases
+    /// the renderer draws the raw chord between endpoints.
+    enum SegmentSnap: Sendable {
+        case snapped([CLLocationCoordinate2D])
+        case fallback
+    }
+
+    /// Cache key for one segment pair, quantized to 5 decimals
+    /// (~1 m precision at temperate latitudes). Two subsequent
+    /// snap runs that pass through the same waypoint pair — even
+    /// as the whole-trip key churns — hit the same segment cache
+    /// entry.
+    ///
+    /// Built from `stableHash` rather than `String(format:)`: a
+    /// whole-trip snap calls this once per segment, and on the
+    /// Guardian's Live view that ran on every 30 fps marker tick.
+    /// Formatting four doubles per segment was a measurable slice
+    /// of each frame's main-thread budget for no benefit — the key
+    /// is never shown to anyone, it only has to be stable.
+    fileprivate static func segmentKey(_ from: CLLocationCoordinate2D,
+                                       _ to: CLLocationCoordinate2D) -> String {
+        var h = FNV1a()
+        h.combine(from)
+        h.combine(to)
+        return h.keyString
+    }
+
+    /// Memoized `snappedTrips(_:)` output, keyed by a stable hash of the
+    /// input fixes. Dropped wholesale whenever `cache` changes (see
+    /// `invalidateTripsMemo`), so a memo can never outlive the snap
+    /// result it was derived from.
+    ///
+    /// Why this matters: `snappedTrips` is called from inside a SwiftUI
+    /// `body`, and the Guardian views re-render constantly for reasons
+    /// that have nothing to do with the trail data — the Live marker
+    /// animator ticks at 30 fps, CoreData remote-change notifications
+    /// fire on every incoming fix, and this service's own `isWorking` /
+    /// `progress` publishes invalidate the view too. Each of those used
+    /// to re-run trip segmentation, the micro-trip displacement sum,
+    /// subsampling and cache-key construction for every profile on
+    /// screen. With snap off, `rawTrips` skips three of those four
+    /// passes — which is exactly why the lag showed up only with snap
+    /// on. Now identical input is answered from the memo in one hash
+    /// pass, and real work happens only when the fixes or the snap
+    /// cache actually change.
+    /// A memoized result plus the set of trip cache keys it consulted
+    /// while being built. Tracking the dependencies lets a completing
+    /// snap invalidate only the trails that were actually waiting on it
+    /// — with several devices on screen, each snap completion otherwise
+    /// dropped every profile's memo, and since snaps complete
+    /// continuously (the rate limiter spaces them 1.5 s apart) no memo
+    /// survived long enough to be used.
+    private struct TripsMemo {
+        let trips: [IdentifiedTrip]
+        let dependsOn: Set<String>
+    }
+
+    private var tripsMemo: [UInt64: TripsMemo] = [:]
+
+    /// Collects the trip cache keys consulted by the in-progress
+    /// `computeSnappedTrips` call. Non-nil only for the duration of that
+    /// call, which is synchronous and MainActor-isolated, so there's no
+    /// reentrancy to worry about.
+    private var currentLookupKeys: Set<String>?
+
+    /// Memo cap. One entry per (profile, trail) currently on screen, so
+    /// a handful in practice; the cap only guards against a view that
+    /// churns its input in a way we didn't anticipate.
+    private static let maxTripsMemoEntries = 32
+
     /// Whether at least one snap is currently in flight.
     @Published private(set) var isWorking: Bool = false
 
@@ -200,8 +384,16 @@ final class SnapToRoadsService: ObservableObject {
 
     /// On-disk LRU cap. ~128 trails at maybe 5–10 KB each ≈ 1 MB worst case
     /// — small enough to keep, large enough to cover a couple weeks of daily
-    /// trails for a family of four.
+    /// trails for a family of four. tvOS uses a much smaller cap (24) to
+    /// stay inside the 4th-gen Apple TV's ~256 MB app budget; the cache
+    /// is a nice-to-have rather than a correctness feature, so trimming
+    /// it there costs a few extra MKDirections calls but no user-visible
+    /// data.
+    #if os(tvOS)
+    private static let maxCacheEntries = 24
+    #else
     private static let maxCacheEntries = 128
+    #endif
 
     /// Requests currently being computed, deduplicated by cache key.
     private var inFlight: Set<String> = []
@@ -332,6 +524,26 @@ final class SnapToRoadsService: ObservableObject {
     /// changed — reducing the drawable-lifecycle churn that occasionally
     /// trips MapKit's debug assertion under Metal API Validation.
     func snappedTrips(_ fixes: [TimedFix]) -> [IdentifiedTrip] {
+        // One cheap, allocation-free hash pass stands in for the whole
+        // pipeline below when nothing has changed since the last render.
+        var h = FNV1a()
+        h.combine(Int64(fixes.count))
+        for fix in fixes { h.combine(fix) }
+        let memoKey = h.value
+        if let memo = tripsMemo[memoKey] { return memo.trips }
+
+        currentLookupKeys = []
+        let result = computeSnappedTrips(fixes)
+        let dependsOn = currentLookupKeys ?? []
+        currentLookupKeys = nil
+
+        if tripsMemo.count >= Self.maxTripsMemoEntries { tripsMemo.removeAll() }
+        tripsMemo[memoKey] = TripsMemo(trips: result, dependsOn: dependsOn)
+        return result
+    }
+
+    /// Uncached body of `snappedTrips(_:)`.
+    private func computeSnappedTrips(_ fixes: [TimedFix]) -> [IdentifiedTrip] {
         let trips = Self.segmentIntoTrips(fixes,
                                           maxGapSeconds: Self.tripBreakGapSeconds)
         return trips.enumerated().flatMap { (idx, trip) -> [IdentifiedTrip] in
@@ -425,6 +637,9 @@ final class SnapToRoadsService: ObservableObject {
         let sampled = Self.subsample(trip,
                                      minSegmentMeters: Self.subsampleThresholdMeters)
         let key = cacheKey(sampled.map(\.coordinate))
+        // Record the dependency so the memo holding this result is
+        // dropped when — and only when — this key's snap lands.
+        currentLookupKeys?.insert(key)
         if let cached = cache[key] { return cached }
         scheduleSnap(key: key, fixes: sampled)
         return [SnappedChunk(coords: trip.map(\.coordinate), isFallback: false)]
@@ -436,9 +651,7 @@ final class SnapToRoadsService: ObservableObject {
         guard trip.count >= 2 else { return 0 }
         var total: CLLocationDistance = 0
         for i in 1..<trip.count {
-            let a = CLLocation(latitude: trip[i - 1].latitude, longitude: trip[i - 1].longitude)
-            let b = CLLocation(latitude: trip[i].latitude,     longitude: trip[i].longitude)
-            total += b.distance(from: a)
+            total += metersBetween(trip[i - 1].coordinate, trip[i].coordinate)
         }
         return total
     }
@@ -458,9 +671,7 @@ final class SnapToRoadsService: ObservableObject {
             let fix = fixes[i]
             let last = current[current.count - 1]
             let dt = fix.timestamp.timeIntervalSince(last.timestamp)
-            let lastLoc = CLLocation(latitude: last.latitude, longitude: last.longitude)
-            let thisLoc = CLLocation(latitude: fix.latitude, longitude: fix.longitude)
-            let distance = thisLoc.distance(from: lastLoc)
+            let distance = metersBetween(last.coordinate, fix.coordinate)
             // Break on EITHER a long time gap OR a long distance gap.
             // The distance gate catches the off-grid case where GPS
             // re-acquires several km away within the time window —
@@ -477,11 +688,33 @@ final class SnapToRoadsService: ObservableObject {
         return trips
     }
 
+    /// Drops every memoized `snappedTrips` result. Must be called from
+    /// anywhere `cache` is mutated: a memo built while a trip was still
+    /// showing its raw placeholder would otherwise keep being returned
+    /// after the real snapped geometry landed, and the polyline would
+    /// never swap.
+    private func invalidateTripsMemo() {
+        tripsMemo.removeAll(keepingCapacity: true)
+    }
+
+    /// Targeted variant: drops only the memos that consulted `key`.
+    /// Everything else — every other device's trail on the same map —
+    /// keeps its memo and stays off the recompute path.
+    private func invalidateTripsMemo(dependingOn key: String) {
+        guard !tripsMemo.isEmpty else { return }
+        for (memoKey, memo) in tripsMemo where memo.dependsOn.contains(key) {
+            tripsMemo.removeValue(forKey: memoKey)
+        }
+    }
+
     /// Drops cached snapped routes (in-memory and on-disk).
     func invalidateCache() {
         cache.removeAll()
+        invalidateTripsMemo()
         entryAddedAt.removeAll()
         throttledKeys.removeAll()
+        segmentCache.removeAll()
+        segmentAddedAt.removeAll()
         hasThrottledResults = false
         try? FileManager.default.removeItem(at: Self.cacheURL)
     }
@@ -499,12 +732,11 @@ final class SnapToRoadsService: ObservableObject {
     {
         guard fixes.count > 2 else { return fixes }
         var result: [TimedFix] = [fixes[0]]
-        var lastKept = CLLocation(latitude: fixes[0].latitude,
-                                  longitude: fixes[0].longitude)
+        result.reserveCapacity(fixes.count / 8 + 2)
+        var lastKept = fixes[0].coordinate
         for i in 1..<(fixes.count - 1) {
-            let here = CLLocation(latitude: fixes[i].latitude,
-                                  longitude: fixes[i].longitude)
-            if here.distance(from: lastKept) >= minSegmentMeters {
+            let here = fixes[i].coordinate
+            if metersBetween(here, lastKept) >= minSegmentMeters {
                 result.append(fixes[i])
                 lastKept = here
             }
@@ -526,8 +758,16 @@ final class SnapToRoadsService: ObservableObject {
             self.recomputeProgress()
         }
 
+        // Snapshot the per-segment cache so `compute()` can look up
+        // previously-snapped pairs without a MainActor hop. Dict
+        // value-type copy is cheap (Swift COW) — mutations we
+        // make below never leak back into `existing`.
+        let existing = self.segmentCache
+
         Task { [weak self] in
-            let (snapped, complete) = await Self.compute(fixes: fixes)
+            let (snapped, complete, newSegments) = await Self.compute(
+                fixes: fixes, existing: existing
+            )
             await MainActor.run {
                 guard let self else { return }
                 // Cache in memory either way so we don't re-request the
@@ -537,6 +777,7 @@ final class SnapToRoadsService: ObservableObject {
                 // we don't want that degraded result frozen into the
                 // on-disk cache. A later launch re-snaps it cleanly.
                 self.cache[key] = snapped
+                self.invalidateTripsMemo(dependingOn: key)
                 if complete {
                     self.entryAddedAt[key] = Date()
                     self.throttledKeys.remove(key)
@@ -546,6 +787,17 @@ final class SnapToRoadsService: ObservableObject {
                     // render is rate-limited, not data-gapped.
                     self.throttledKeys.insert(key)
                 }
+                // Merge each newly-snapped segment into the shared
+                // per-segment cache so subsequent whole-trip snaps
+                // (Live-mode re-runs after another fix appends) reuse
+                // them and don't spend MKDirections calls on the
+                // stable prefix.
+                let now = Date()
+                for (segKey, snap) in newSegments {
+                    self.segmentCache[segKey] = snap
+                    self.segmentAddedAt[segKey] = now
+                }
+                self.evictSegmentCacheIfNeeded()
                 self.hasThrottledResults = !self.throttledKeys.isEmpty
                 self.inFlight.remove(key)
                 self.perKeyProgress.removeValue(forKey: key)
@@ -558,15 +810,55 @@ final class SnapToRoadsService: ObservableObject {
         }
     }
 
+    private func evictSegmentCacheIfNeeded() {
+        guard segmentCache.count > Self.maxSegmentCacheEntries else { return }
+        let sorted = segmentAddedAt.sorted { $0.value < $1.value }
+        let removeCount = segmentCache.count - Self.maxSegmentCacheEntries
+        for (key, _) in sorted.prefix(removeCount) {
+            segmentCache.removeValue(forKey: key)
+            segmentAddedAt.removeValue(forKey: key)
+        }
+    }
+
+    /// Trailing-edge coalescing window for `progress` / `isWorking`
+    /// publishes. Both are purely cosmetic (the "snapping 3/9…" badge),
+    /// but each assignment invalidates every view observing this service
+    /// — which on a Guardian dashboard means re-running the CoreData
+    /// fetch and map content build for every profile on screen. A snap
+    /// storm (one trip per profile, each flipping isWorking on and off)
+    /// turned that into a stream of full-dashboard rebuilds. 250 ms
+    /// keeps the badge feeling live while capping the cost at 4
+    /// invalidations per second.
+    private static let progressPublishInterval: TimeInterval = 0.25
+    private var progressPublishTask: Task<Void, Never>?
+
+    /// Coalesced. Recomputes and publishes at most once per
+    /// `progressPublishInterval`; the pending publish reads whatever
+    /// state is current when it fires, so the last value always lands.
     private func recomputeProgress() {
+        guard progressPublishTask == nil else { return }
+        progressPublishTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.progressPublishInterval))
+            guard let self else { return }
+            self.progressPublishTask = nil
+            self.publishProgressNow()
+        }
+    }
+
+    private func publishProgressNow() {
         var completed = 0
         var total = 0
         for (_, p) in perKeyProgress {
             completed += p.completed
             total += p.total
         }
-        progress = SnapProgress(completed: completed, total: total)
-        isWorking = !inFlight.isEmpty
+        let newProgress = SnapProgress(completed: completed, total: total)
+        // Skip no-op writes: `@Published` fires its willSet on every
+        // assignment, equal or not, and an equal assignment costs a
+        // full view invalidation for a value nobody can see change.
+        if newProgress != progress { progress = newProgress }
+        let working = !inFlight.isEmpty
+        if working != isWorking { isWorking = working }
     }
 
     private func evictIfNeeded() {
@@ -578,6 +870,7 @@ final class SnapToRoadsService: ObservableObject {
             entryAddedAt.removeValue(forKey: key)
             throttledKeys.remove(key)
         }
+        invalidateTripsMemo()
         hasThrottledResults = !throttledKeys.isEmpty
     }
 
@@ -599,12 +892,22 @@ final class SnapToRoadsService: ObservableObject {
     /// fallback / snapped. Renderers style fallback chunks as dashed
     /// to make the interpolation visible.
     private static func compute(
-        fixes: [TimedFix]
-    ) async -> (chunks: [SnappedChunk], complete: Bool) {
+        fixes: [TimedFix],
+        existing: [String: SegmentSnap] = [:]
+    ) async -> (chunks: [SnappedChunk], complete: Bool, newSegments: [String: SegmentSnap]) {
         let total = max(0, fixes.count - 1)
         var chunks: [SnappedChunk] = []
         var current: (coords: [CLLocationCoordinate2D], isFallback: Bool)? = nil
         var complete = true
+        // Segments we snap live in this run and hand back to the
+        // caller, who folds them into the instance-level
+        // `segmentCache` under a MainActor.run so the next whole-
+        // trip snap can reuse them without another MKDirections
+        // call. Read-only `existing` (a snapshot from before this
+        // compute started) means every subsequent-trip snap that
+        // walks over the same pair short-circuits the network call
+        // entirely.
+        var newSegments: [String: SegmentSnap] = [:]
 
         // Append a snapped/raw segment to the current chunk if its
         // kind matches; otherwise close the current chunk and open a
@@ -638,9 +941,7 @@ final class SnapToRoadsService: ObservableObject {
             let fromCoord = from.coordinate
             let toCoord = to.coordinate
 
-            let fromLoc = CLLocation(latitude: from.latitude, longitude: from.longitude)
-            let toLoc = CLLocation(latitude: to.latitude, longitude: to.longitude)
-            let distance = fromLoc.distance(from: toLoc)
+            let distance = metersBetween(fromCoord, toCoord)
             let timeDelta = max(1, to.timestamp.timeIntervalSince(from.timestamp))
             let speedKmh = (distance / 1000) / (timeDelta / 3600)
 
@@ -681,8 +982,27 @@ final class SnapToRoadsService: ObservableObject {
                 || speedKmh > 250
             {
                 // Hard-gate raw fallback — flagged so the renderer can
-                // dash it.
+                // dash it. Not cached in `newSegments`: the gate is
+                // pure geometry and re-evaluates instantly next time,
+                // no benefit to spending a cache slot on it.
                 appendSegment([fromCoord, toCoord], isFallback: true)
+                continue
+            }
+
+            // Segment-level cache lookup. Skips the network call
+            // (and, importantly, the shared `limiter.acquire()`
+            // wait) when this exact pair has been snapped before —
+            // the common case on Live-mode re-runs where the trip
+            // grew by one fix at the end and every prior segment
+            // is unchanged.
+            let segKey = segmentKey(fromCoord, toCoord)
+            if let cached = existing[segKey] {
+                switch cached {
+                case .snapped(let coords):
+                    appendSegment(coords, isFallback: false)
+                case .fallback:
+                    appendSegment([fromCoord, toCoord], isFallback: true)
+                }
                 continue
             }
 
@@ -771,20 +1091,46 @@ final class SnapToRoadsService: ObservableObject {
             // AND marks the whole result incomplete (no disk cache).
             let isFallback = coords.count <= 2
             appendSegment(coords, isFallback: isFallback)
+            // Stash the result for reuse by the next whole-trip
+            // snap. Cache the geometric fallback (empty route / bad
+            // coords / rejected by stretch-ratio) — those decisions
+            // are stable and re-checking them next render just
+            // burns another MKDirections call. Do NOT cache
+            // throttle-exhausted fallbacks: those are transient
+            // (the throttle window will clear), and caching them as
+            // fallback would freeze a raw chord in place across the
+            // whole trail. The `complete == false` gate already
+            // prevents the trip-level cache from being persisted;
+            // matching that behaviour here keeps the two caches
+            // consistent.
+            if isFallback {
+                if complete {
+                    newSegments[segKey] = .fallback
+                }
+            } else {
+                newSegments[segKey] = .snapped(coords)
+            }
         }
 
         if let cur = current {
             chunks.append(SnappedChunk(coords: cur.coords, isFallback: cur.isFallback))
         }
-        return (chunks, complete)
+        return (chunks, complete, newSegments)
     }
 
     private func cacheKey(_ coords: [CLLocationCoordinate2D]) -> String {
-        // 5 decimals ≈ 1 m precision — stable enough that minor numerical
-        // wobble doesn't bust the cache, fine enough that two genuinely
+        // Quantized to ~1 m — stable enough that minor numerical wobble
+        // doesn't bust the cache, fine enough that two genuinely
         // different paths get different keys.
-        coords.map { String(format: "%.5f,%.5f", $0.latitude, $0.longitude) }
-            .joined(separator: "|")
+        //
+        // Was a `"%.5f,%.5f"`-per-point string joined with "|", i.e. a
+        // ~25 B-per-waypoint allocation (a few KB for a long trail) that
+        // then had to be hashed in full on every dictionary lookup —
+        // built fresh on every SwiftUI render, for every profile. The
+        // hash carries the same information in 16 characters.
+        var h = FNV1a()
+        for coord in coords { h.combine(coord) }
+        return h.keyString
     }
 
     // MARK: - Disk persistence
@@ -842,7 +1188,14 @@ final class SnapToRoadsService: ObservableObject {
     //     guard (snap rejected if > 1.8× straight distance). v6
     //     entries that captured wrong-road routes from before the
     //     guards have to be flushed; bump invalidates them.
-    nonisolated private static let cacheVersion = 7
+    // v8 (this bump): cache keys switched from a
+    //     `"%.5f,%.5f"`-per-waypoint joined string to a stable FNV-1a
+    //     hash, and the distance math moved from `CLLocation.distance`
+    //     to haversine (both for main-thread cost — see
+    //     `metersBetween`). v7 keys can no longer be regenerated, so
+    //     those entries would sit in the file forever without ever
+    //     hitting; the bump drops them. Cost is one re-snap pass.
+    nonisolated private static let cacheVersion = 8
 
     /// `Caches/MapMe/snap-roads-cache.json`. We use `.cachesDirectory` (not
     /// `.applicationSupportDirectory`) because this data is rebuildable from

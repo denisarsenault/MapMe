@@ -65,20 +65,30 @@
 		<true/>
 	</dict>
 	<!--
-		Portrait-only on iPhone + iPad. Locking rotation lets the
-		layouts (especially the dashboard chrome and the map +
-		device-card stack) be tuned once for a known aspect ratio
-		instead of needing landscape variants. Both arrays contain
-		only `UIInterfaceOrientationPortrait`; the system blocks
-		rotation to any other orientation.
+		iPhone stays portrait-only. Locking rotation lets the phone
+		layouts (dashboard chrome, map + device-card stack) be tuned
+		once for a known aspect ratio instead of needing landscape
+		variants.
+
+		iPad allows ALL four orientations. Locking iPad to portrait
+		was making iPadOS render the portrait viewport centered with
+		black bars whenever the device was held in landscape — a
+		"phone in the middle of the iPad" effect. With all four
+		orientations enabled iPadOS rotates the app to fill the
+		screen normally.
 	-->
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 	<key>UISupportedInterfaceOrientations~ipad</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 </dict>
 </plist>

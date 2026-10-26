@@ -38,6 +38,14 @@ struct MapMeWatchApp: App {
                         }
                 }
             }
+            .task {
+                // Register the watch as a trusted device — idempotent,
+                // refreshes lastActiveAt on every launch. Deferred out
+                // of init so the splash / first frame paints first
+                // (same reasoning as GuardianAudioAlertService on iOS).
+                try? await Task.sleep(for: .milliseconds(200))
+                TrustedDeviceService.shared.registerCurrentDevice()
+            }
             .onChange(of: scenePhase) { _, phase in
                 handleScenePhase(phase)
             }

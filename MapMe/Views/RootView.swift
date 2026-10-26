@@ -82,14 +82,15 @@ private struct GuardianTabsView: View {
         // top bar of date controls and device chips.
         AppleTVGuardianDashboardView()
         #else
-        // iPhone / iPad: keep the tabbed family list for now.
-        TabView {
-            FamilyDashboardView()
-                .tabItem { Label("Family", systemImage: "person.2") }
-
-            SettingsView()
-                .tabItem { Label("Settings", systemImage: "gearshape") }
-        }
+        // iPhone AND iPad both get the map-first dashboard — the
+        // Live map IS the primary window, with a chip row for
+        // device selection and toolbar buttons for Settings /
+        // pairing / add-tracker. Matches the tvOS + macOS UX
+        // (map-first). The old iPhone-only tabbed FamilyDashboardView
+        // + modal Live sheet is deprecated; MinorDetailView is
+        // still reachable via the "Show details" context menu on
+        // device chips.
+        IPadGuardianDashboardView()
         #endif
     }
 }

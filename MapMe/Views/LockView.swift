@@ -111,6 +111,16 @@ struct LockView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         #endif
         .onAppear { focused = true }
+        // Copyright pinned to the bottom of the screen via a wrapping
+        // ZStack. `forceLight` on tvOS because the lock background is
+        // deliberately dark there; adaptive on iOS/macOS.
+        .overlay(alignment: .bottom) {
+            #if os(tvOS)
+            CopyrightFooter(style: .forceLight)
+            #else
+            CopyrightFooter()
+            #endif
+        }
         #if os(macOS)
         // The 900 × 720 main-app window is way too much real estate
         // for a sign-in column. Resize the host NSWindow down to a

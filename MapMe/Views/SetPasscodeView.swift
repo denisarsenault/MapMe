@@ -83,6 +83,13 @@ struct SetPasscodeView: View {
         .frame(maxWidth: Self.maxContentWidth)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
         #endif
+        .overlay(alignment: .bottom) {
+            #if os(tvOS)
+            CopyrightFooter(style: .forceLight)
+            #else
+            CopyrightFooter()
+            #endif
+        }
         #if os(macOS)
         // Same compact NSWindow treatment as `LockView` — see the
         // `resizeWindow(to:)` helper there for rationale and behaviour.

@@ -1,12 +1,18 @@
 import Foundation
 import CoreData
 import CloudKit
+import os
 #if canImport(UIKit)
 import UIKit
 #endif
 #if os(watchOS)
 import WatchKit
 #endif
+
+/// Filter Console.app to `subsystem: com.mybrightzone.app category:
+/// sharing` to see the share-creation path. Complements the
+/// higher-level `pairing` category owned by `PairingView`.
+private let shareLog = Logger(subsystem: "com.mybrightzone.app", category: "sharing")
 
 /// Creates and accepts CloudKit shares for the minor's profile object.
 /// The minor shares a single `MinorProfile` row; CoreData/CloudKit migrates
@@ -99,7 +105,106 @@ final class SharingService: ObservableObject {
     /// values are ready to hand to a `UICloudSharingController` so the user
     /// can pick a delivery channel (Messages, Mail, etc.).
     func makeShare(for profile: MinorProfile) async throws -> (CKShare, CKContainer) {
+        // Preflight — a "share hangs forever" symptom is almost always
+        // one of these, so log them explicitly before we call the
+        // NSPersistentCloudKitContainer path (which can block in ways
+        // that produce no diagnostic on their own).
+        shareLog.notice("makeShare preflight: checking iCloud account status")
+        let container = CKContainer(identifier: "iCloud.com.mapme.app")
+        let status: CKAccountStatus = await withCheckedContinuation { cont in
+            container.accountStatus { s, err in
+                if let err {
+                    shareLog.error("accountStatus error: \(err.localizedDescription, privacy: .public)")
+                }
+                cont.resume(returning: s)
+            }
+        }
+        shareLog.notice("iCloud accountStatus = \(String(describing: status))")
+        switch status {
+        case .available:
+            break
+        case .noAccount:
+            throw NSError(
+                domain: "MapMe.Sharing", code: 400,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "No iCloud account is signed in on this device. Open Settings → [your name] and sign in."]
+            )
+        case .restricted:
+            throw NSError(
+                domain: "MapMe.Sharing", code: 401,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "This device's iCloud account is restricted (Screen Time or parental controls). MapMe can't create a share until that's lifted."]
+            )
+        case .temporarilyUnavailable, .couldNotDetermine:
+            throw NSError(
+                domain: "MapMe.Sharing", code: 402,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "iCloud is currently unreachable. Check your connection and try again in a moment."]
+            )
+        @unknown default:
+            shareLog.error("Unknown accountStatus (\(status.rawValue)) — proceeding anyway")
+        }
+
+        // fetchShares FIRST. `NSPersistentCloudKitContainer.share([profile],
+        // to: nil)` is documented as "returns the existing share if
+        // there is one" but in practice — especially after a partial
+        // 134421 recovery — it can hang forever if the mirroring
+        // delegate is between states. `fetchShares` is a much lighter
+        // synchronous read against the store and reveals whether a
+        // share already exists for this profile.
+        //
+        // Runs off the main actor via GCD + a checked continuation.
+        // `SharingService` is `@MainActor`, so a direct call would
+        // inline the synchronous `fetchShares` onto the main thread.
+        // When the persistent store coordinator is contended — most
+        // commonly by a large CloudKit export draining an initial-
+        // sync fan-out — the synchronous read parks the main thread
+        // waiting for the coordinator lock, which freezes the entire
+        // UI (touches drop, the pairing-status ticker starves, the
+        // app looks dead). Hopping to a background queue means
+        // coordinator contention parks a worker thread instead; the
+        // main runloop stays responsive, and the `await` here
+        // suspends this @MainActor context without holding it.
+        // Both `pcContainer` and `objectID` are `Sendable`
+        // (NSPersistentCloudKitContainer is thread-safe;
+        // NSManagedObjectID is documented thread-safe once obtained).
+        let objectID = profile.objectID
+        let pcContainer = persistence.container
+        let fetchResult: Result<[NSManagedObjectID: CKShare], Error>
+        do {
+            let value: [NSManagedObjectID: CKShare] = try await withCheckedThrowingContinuation { cont in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do {
+                        let result = try pcContainer.fetchShares(matching: [objectID])
+                        cont.resume(returning: result)
+                    } catch {
+                        cont.resume(throwing: error)
+                    }
+                }
+            }
+            fetchResult = .success(value)
+        } catch {
+            fetchResult = .failure(error)
+        }
+        switch fetchResult {
+        case .success(let existing):
+            if let existingShare = existing[objectID] {
+                shareLog.notice("fetchShares found existing share for profile — reusing (no CK call needed)")
+                existingShare[CKShare.SystemFieldKey.title] = "MapMe – \(profile.displayName ?? "Minor")" as CKRecordValue
+                existingShare.publicPermission = .readWrite
+                return (existingShare, ckContainerForDefault())
+            } else {
+                shareLog.notice("fetchShares returned no existing share — proceeding to create")
+            }
+        case .failure(let error):
+            shareLog.error("fetchShares threw: \(error.localizedDescription, privacy: .public) — proceeding to create anyway")
+        }
+
+        shareLog.notice("Calling NSPersistentCloudKitContainer.share([profile], to: nil)")
+        let start = Date()
         let (_, share, ckContainer) = try await persistence.container.share([profile], to: nil)
+        let elapsed = Date().timeIntervalSince(start)
+        shareLog.notice("container.share returned after \(Int(elapsed * 1000)) ms")
         share[CKShare.SystemFieldKey.title] = "MapMe – \(profile.displayName ?? "Minor")" as CKRecordValue
         // `.readWrite`, not `.none`. The Guardian must be able to write
         // `consentGrantedAt` back into this shared profile — that's the whole
@@ -184,6 +289,57 @@ final class SharingService: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Removes every `MinorProfile` that has zero `LocationRecord`s.
+    ///
+    /// Fixes the "Guardian dashboard is cluttered with 5 duplicate
+    /// profiles that all say 'No data yet'" scenario. Each
+    /// re-invite from a Minor (uninstall + reinstall, or repeated
+    /// tap of Invite Guardian after a `deviceIdentifier` change)
+    /// creates a fresh `MinorProfile` in the shared zone; when the
+    /// old one goes silent it just sits in the list forever.
+    /// Manually swipe-deleting 5+ rows is tedious.
+    ///
+    /// Returns the number of profiles removed. Runs each removal
+    /// through `removeProfile(_:)` so CKShares are torn down
+    /// properly on the way out.
+    @discardableResult
+    func removeEmptyProfiles() async -> Int {
+        let ctx = persistence.container.viewContext
+        let request = NSFetchRequest<MinorProfile>(entityName: "MinorProfile")
+        guard let all = try? ctx.fetch(request) else { return 0 }
+
+        // "Empty" = zero location records. Count via SQLite index so
+        // huge tracked profiles don't materialise rows just to check
+        // if they have any.
+        var toRemove: [MinorProfile] = []
+        for profile in all {
+            let count = NSFetchRequest<LocationRecord>(entityName: "LocationRecord")
+            count.predicate = NSPredicate(format: "profile == %@", profile)
+            let n = (try? ctx.count(for: count)) ?? 0
+            if n == 0 { toRemove.append(profile) }
+        }
+
+        var removed = 0
+        for profile in toRemove {
+            do {
+                try await removeProfile(profile)
+                removed += 1
+            } catch {
+                // Best-effort — one failed removal shouldn't stop
+                // the rest. The user can retry.
+            }
+        }
+        return removed
+    }
+
+    /// The container we use for all CloudKit operations. Kept as a
+    /// helper so the `fetchShares`-reuse path can return the same
+    /// CKContainer instance that the standard `share([...], to: nil)`
+    /// path would have handed back.
+    private func ckContainerForDefault() -> CKContainer {
+        CKContainer(identifier: "iCloud.com.mapme.app")
     }
 
     // MARK: - Share acceptance (Guardian)

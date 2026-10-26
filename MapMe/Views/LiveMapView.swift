@@ -4,19 +4,54 @@ import MapKit
 import CoreData
 
 struct LiveMapView: View {
-    #if os(iOS)
+    // Env-injected on both iOS and macOS so this view sees the same
+    // singleton the app-level start/stop UI and the Siri intents
+    // mutate. The old `#else @StateObject private var location =
+    // LocationService()` branch on macOS produced a SEPARATE
+    // LocationService instance with its own CLLocationManager, which
+    // meant the Settings-app Start button (which touches
+    // LocationService.shared) and this view's tracking state
+    // disagreed — flipping the Settings toggle didn't turn on the
+    // manager backing the map, and the map's `isTracking` never
+    // reflected reality.
     @EnvironmentObject private var location: LocationService
-    #else
-    @StateObject private var location = LocationService()
-    #endif
 
     @ObservedObject private var snapService = SnapToRoadsService.shared
 
-    @FetchRequest(
-        sortDescriptors: [NSSortDescriptor(key: "timestamp", ascending: false)],
-        predicate: NSPredicate(format: "timestamp >= %@", Calendar.current.startOfDay(for: Date()) as NSDate),
-        animation: .default
-    ) private var todayRecords: FetchedResults<LocationRecord>
+    /// Today's own-device records, bounded.
+    ///
+    /// Two guards on top of "timestamp >= startOfDay":
+    ///
+    ///   1. `deviceIdentifier == DeviceID.current` — scopes to fixes
+    ///      this device wrote. Without this, a Guardian-role device
+    ///      that ALSO recorded local fixes would pull in every
+    ///      Minor's records from the shared store (via CloudKit) and
+    ///      render everyone on the "my Live tracking" map.
+    ///   2. `fetchLimit: 3_000` — cap on rows materialised into the
+    ///      SwiftUI `FetchedResults` cache. HighAccuracy writes ~2×/
+    ///      minute, so 3000 covers ~24 h with headroom. Without a cap,
+    ///      an all-day HighAccuracy session at 1-Hz cadence
+    ///      snowballed the resident set into hundreds of MB — every
+    ///      `NSPersistentStoreRemoteChange` re-hydrated the entire
+    ///      set, and the map polyline builders allocated a fresh
+    ///      `[TimedFix]` copy on every body invocation. That plus
+    ///      the CloudKit export backlog made the whole tab OOM-prone
+    ///      when a tab switch pushed extra allocations through.
+    @FetchRequest(fetchRequest: Self.buildTodayRequest(),
+                  animation: .default)
+    private var todayRecords: FetchedResults<LocationRecord>
+
+    private static func buildTodayRequest() -> NSFetchRequest<LocationRecord> {
+        let request = NSFetchRequest<LocationRecord>(entityName: "LocationRecord")
+        request.sortDescriptors = [NSSortDescriptor(key: "timestamp", ascending: false)]
+        request.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [
+            NSPredicate(format: "timestamp >= %@",
+                        Calendar.current.startOfDay(for: Date()) as NSDate),
+            NSPredicate(format: "deviceIdentifier == %@", DeviceID.current),
+        ])
+        request.fetchLimit = 3_000
+        return request
+    }
 
     @State private var camera: MapCameraPosition = .userLocation(fallback: .automatic)
 
@@ -35,7 +70,15 @@ struct LiveMapView: View {
         let trips: [IdentifiedTrip] = snapService.isEnabled
             ? snapService.snappedTrips(fixes)
             : SnapToRoadsService.rawTrips(fixes)
-        let rawTrips = SnapToRoadsService.rawTrips(fixes)
+        // Only segmented when the overlay is actually being drawn. This
+        // used to be computed unconditionally, which meant every render
+        // — including the constant ones Live tracking produces — paid
+        // for a full trip segmentation pass whose result was thrown
+        // away in the common case where the overlay is off.
+        let rawTrips: [IdentifiedTrip] =
+            (snapService.isEnabled && snapService.showRawOverlay)
+            ? SnapToRoadsService.rawTrips(fixes)
+            : []
 
         Map(position: $camera) {
             UserAnnotation()
@@ -115,6 +158,15 @@ struct LiveMapView: View {
                 .background(.thinMaterial, in: Capsule())
 
             statusBar
+
+            // Siri hint chip — StartTrackingIntent is the useful
+            // command from this screen for the Minor. Dismissible;
+            // stays dismissed across relaunches once the user has
+            // seen it.
+            MapMeSiriTip(
+                intent: StartTrackingIntent(),
+                storageKey: "MapMe.siriTip.liveMap"
+            )
         }
         .padding(.top, 8)
     }

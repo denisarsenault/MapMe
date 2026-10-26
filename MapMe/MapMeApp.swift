@@ -59,8 +59,10 @@ struct MapMeApp: App {
     @StateObject private var persistence = PersistenceController.shared
     @StateObject private var roleStore = AppRoleStore()
     @StateObject private var guardianSync = GuardianSyncService()
+    #if os(iOS) || os(macOS)
+    @StateObject private var location = LocationService.shared
+    #endif
     #if os(iOS)
-    @StateObject private var location = LocationService()
     @StateObject private var phoneResponder = PhoneConnectivityResponder.shared
     #endif
     @Environment(\.scenePhase) private var scenePhase
@@ -74,12 +76,19 @@ struct MapMeApp: App {
         #if os(iOS)
         BackgroundTaskScheduler.register()
         #endif
-        // Touch the Guardian audio-alert service singleton so its
-        // remote-change observer registers now if the user has the
-        // "audio alert on motion" toggle on. On non-Guardian devices
-        // this is a cheap no-op — the service short-circuits when
-        // `isEnabled` is false.
-        _ = GuardianAudioAlertService.shared
+        // GuardianAudioAlertService.shared touch was here but got
+        // moved into a background `.task` on the root view — see
+        // `body`. Its init calls `start()` which registers a
+        // NotificationCenter observer keyed on
+        // `PersistenceController.shared.container.persistentStoreCoordinator`.
+        // Touching that from `MapMeApp.init()` synchronously
+        // forces the entire NSPersistentCloudKitContainer to
+        // initialise before SwiftUI has a chance to render the
+        // splash — and when the CloudKit backlog is large, that
+        // init runs long enough that the splash stays stuck on
+        // screen for tens of seconds. Deferring it lets the UI
+        // paint first; the service is still up in time to catch
+        // real user-driven events.
     }
 
     var body: some Scene {
@@ -90,7 +99,7 @@ struct MapMeApp: App {
                     .environmentObject(roleStore)
                     .environmentObject(guardianSync)
                     .environment(\.managedObjectContext, persistence.container.viewContext)
-                    #if os(iOS)
+                    #if os(iOS) || os(macOS)
                     .environmentObject(location)
                     #endif
 
@@ -110,6 +119,21 @@ struct MapMeApp: App {
                     if roleStore.role == .guardian {
                         await guardianSync.ensureSubscription()
                     }
+                }
+                .task {
+                    // Deferred `GuardianAudioAlertService.shared`
+                    // touch — see `init()` for why this can't run
+                    // inline at app init. A short sleep lets the
+                    // splash + first frame paint before we force
+                    // the CloudKit stack + audio session + observer
+                    // registration.
+                    try? await Task.sleep(for: .milliseconds(200))
+                    _ = GuardianAudioAlertService.shared
+                    // Also touch TrustedDeviceService and register
+                    // this device — idempotent, refreshes the
+                    // lastActiveAt column on every launch so the
+                    // Trusted Devices list stays honest.
+                    TrustedDeviceService.shared.registerCurrentDevice()
                 }
                 .onChange(of: roleStore.role) { _, newValue in
                     if newValue == .guardian {
@@ -150,6 +174,7 @@ struct MapMeApp: App {
                 .environmentObject(auth)
                 .environmentObject(roleStore)
                 .environmentObject(guardianSync)
+                .environmentObject(location)
                 .environment(\.managedObjectContext, persistence.container.viewContext)
                 .frame(minWidth: 480, minHeight: 420)
         }
@@ -169,6 +194,7 @@ struct MapMeApp: App {
                 ArchiveService(context: persistence.container.newBackgroundContext())
                     .runArchivePassIfNeeded()
             }
+            LaunchReminderService.shared.recordAppActivity()
             #endif
         default:
             break

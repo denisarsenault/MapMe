@@ -7,8 +7,9 @@ import UIKit
 struct SettingsView: View {
     @EnvironmentObject private var auth: AuthService
     @EnvironmentObject private var roleStore: AppRoleStore
+    @EnvironmentObject private var guardianSync: GuardianSyncService
     @Environment(\.managedObjectContext) private var ctx
-    #if os(iOS)
+    #if os(iOS) || os(macOS)
     @EnvironmentObject private var location: LocationService
     #endif
     #if os(iOS) || os(macOS)
@@ -19,6 +20,13 @@ struct SettingsView: View {
     @State private var showResetConfirm = false
     @State private var showChangePasscode = false
     @State private var showRoleResetConfirm = false
+    @State private var showSyncCacheResetConfirm = false
+    @State private var syncCacheResetMessage: String?
+    @State private var showRemoveEmptyConfirm = false
+    @State private var removeEmptyMessage: String?
+    @State private var isForceSyncing = false
+    @State private var forceSyncStatus: String?
+    @StateObject private var sharing = SharingService()
 
     var body: some View {
         NavigationStack {
@@ -34,7 +42,7 @@ struct SettingsView: View {
                     Button("Lock now") { auth.lock() }
                 }
 
-                #if os(iOS)
+                #if os(iOS) || os(macOS)
                 Section("Tracking") {
                     LabeledContent("Authorization", value: authText)
                     if location.isTracking {
@@ -76,6 +84,10 @@ struct SettingsView: View {
                 adaptiveSamplingSection
                 #endif
 
+                #if os(iOS)
+                launchReminderSection
+                #endif
+
                 if roleStore.role == .guardian {
                     guardianAudioAlertSection
                 }
@@ -86,6 +98,54 @@ struct SettingsView: View {
                             .runArchivePass()
                     }
                     Button("Delete all history", role: .destructive) { showResetConfirm = true }
+                }
+
+                // Guardian-only "last resort" section for when
+                // CloudKit sync gets wedged. Nukes the local record
+                // cache without touching pairings so records
+                // re-import fresh from the shared zones on the next
+                // sync cycle. See `PersistenceController.resetGuardianSharedCache`.
+                if roleStore.role == .guardian {
+                    guardianSyncDiagnosticsSection
+
+                    Section {
+                        Button {
+                            forceSyncNow()
+                        } label: {
+                            Label(forceSyncStatus ?? "Force sync now",
+                                  systemImage: "arrow.triangle.2.circlepath")
+                        }
+                        .disabled(isForceSyncing)
+
+                        Button(role: .destructive) {
+                            showSyncCacheResetConfirm = true
+                        } label: {
+                            Label("Reset sync cache", systemImage: "arrow.clockwise.circle")
+                        }
+                        Button(role: .destructive) {
+                            showRemoveEmptyConfirm = true
+                        } label: {
+                            Label("Remove empty profiles", systemImage: "person.crop.circle.badge.xmark")
+                        }
+                    } header: {
+                        Text("Advanced")
+                    } footer: {
+                        Text("Force sync now: pokes NSPersistentCloudKitContainer to push local writes + pull pending changes immediately, instead of waiting for its next natural cycle. Use when a newly-added device doesn't appear within a few minutes. Reset sync cache: nukes local record cache; keeps pairings intact. Remove empty profiles: bulk-deletes paired devices that have zero fixes (usually old duplicates from reinstalls).")
+                            .font(.caption2)
+                    }
+                }
+
+                Section {
+                    NavigationLink {
+                        TrustedDevicesView()
+                    } label: {
+                        Label("Trusted Devices", systemImage: "checkmark.shield")
+                    }
+                } header: {
+                    Text("Security")
+                } footer: {
+                    Text("Devices signed into your iCloud that have opened MapMe. Revoke any you don't recognise.")
+                        .font(.caption2)
                 }
 
                 Section {
@@ -117,6 +177,120 @@ struct SettingsView: View {
                 Button("Switch", role: .destructive) { roleStore.reset() }
                 Button("Cancel", role: .cancel) {}
             }
+            .confirmationDialog("Reset local sync cache?",
+                                isPresented: $showSyncCacheResetConfirm,
+                                titleVisibility: .visible) {
+                Button("Reset", role: .destructive) { runSyncCacheReset() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This clears the local record cache and forces CloudKit to re-import from your paired Minors' shared zones. Pairings, settings, nicknames, and role selection are preserved. Use only when Minor devices show 'Connected' but no fresh fixes appear.")
+            }
+            .alert("Sync cache reset",
+                   isPresented: Binding(
+                    get: { syncCacheResetMessage != nil },
+                    set: { if !$0 { syncCacheResetMessage = nil } }
+                   ),
+                   presenting: syncCacheResetMessage) { _ in
+                Button("OK", role: .cancel) { syncCacheResetMessage = nil }
+            } message: { msg in
+                Text(msg)
+            }
+            .confirmationDialog("Remove all empty profiles?",
+                                isPresented: $showRemoveEmptyConfirm,
+                                titleVisibility: .visible) {
+                Button("Remove", role: .destructive) { runRemoveEmpty() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Deletes every paired device that has zero fixes. Active devices (any recorded location) are preserved. Removed devices can re-pair by tapping Invite Guardian on their side.")
+            }
+            .alert("Remove empty profiles",
+                   isPresented: Binding(
+                    get: { removeEmptyMessage != nil },
+                    set: { if !$0 { removeEmptyMessage = nil } }
+                   ),
+                   presenting: removeEmptyMessage) { _ in
+                Button("OK", role: .cancel) { removeEmptyMessage = nil }
+            } message: { msg in
+                Text(msg)
+            }
+        }
+    }
+
+    private func runRemoveEmpty() {
+        Task {
+            let removed = await sharing.removeEmptyProfiles()
+            await MainActor.run {
+                PersistenceController.shared.container.viewContext.refreshAllObjects()
+                removeEmptyMessage = removed == 0
+                    ? "No empty profiles found."
+                    : "Removed \(removed) empty profile\(removed == 1 ? "" : "s")."
+            }
+        }
+    }
+
+    /// Nudges `NSPersistentCloudKitContainer` to push local writes +
+    /// pull pending imports NOW rather than waiting for its next
+    /// natural cycle.
+    ///
+    /// What actually kicks the export: writing something. We use an
+    /// idempotent touch on the current device's TrustedDevice row via
+    /// `registerCurrentDevice()` — it updates `lastActiveAt = Date()`
+    /// on every call, which is a real Core Data change that the
+    /// mirroring delegate picks up and turns into a CloudKit export
+    /// op. On the import side, `refreshAllObjects()` invalidates
+    /// stale caches so any pending imports become visible.
+    ///
+    /// Also re-arms `GuardianSyncService.ensureSubscription()` — if
+    /// the CKDatabaseSubscription got torn down by a prior reset,
+    /// this restores it so remote-change notifications can wake the
+    /// app going forward.
+    ///
+    /// UI-wise: shows "Syncing…" for ~2 s while the async work runs
+    /// so the tap gives visible feedback, then flips back to "Force
+    /// sync now" once done.
+    private func forceSyncNow() {
+        guard !isForceSyncing else { return }
+        isForceSyncing = true
+        forceSyncStatus = "Syncing…"
+
+        // 1. Poke a local write to make the mirroring delegate export.
+        TrustedDeviceService.shared.registerCurrentDevice()
+
+        // 2. Force the viewContext to drop stale objects so pending
+        //    imports become visible to open Family / Map views.
+        PersistenceController.shared.container.viewContext.refreshAllObjects()
+
+        // 3. Re-arm the shared-DB subscription if it dropped.
+        Task {
+            await guardianSync.ensureSubscription()
+        }
+
+        // Reset the button label after a short delay — CloudKit's
+        // actual round-trip is 15 s – a few minutes, but 2 s of
+        // "Syncing…" is enough visible feedback that the tap
+        // registered. Real completion is invisible; the user watches
+        // the sidebar populate.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            isForceSyncing = false
+            forceSyncStatus = nil
+        }
+    }
+
+    private func runSyncCacheReset() {
+        PersistenceController.shared.resetGuardianSharedCache { error in
+            if let error {
+                syncCacheResetMessage = "Reset failed: \(error)"
+            } else {
+                // Also nuke the announcement state machines so the
+                // freshly-reimported records start counting trips
+                // from 1 again for each profile.
+                GuardianAudioAlertService.shared.resetAllAnnouncementState()
+                // Force viewContext to drop caches so any open
+                // Family / Map view re-fetches from the emptied
+                // stores instead of showing stale cached results.
+                PersistenceController.shared.container.viewContext.refreshAllObjects()
+                syncCacheResetMessage = "Local cache cleared. Fresh records should arrive from CloudKit within a minute."
+            }
         }
     }
 
@@ -132,21 +306,54 @@ struct SettingsView: View {
     @ViewBuilder
     private var guardianAudioAlertSection: some View {
         Section {
+            // tvOS: use a plain-string Toggle so the focus engine can
+            // land on the switch. A `Toggle` with a `VStack` label
+            // makes the descriptive text steal focus and leaves the
+            // switch un-clickable via the Siri Remote.
+            //
+            // iOS / macOS: keep the richer VStack label so the
+            // description sits inline like every other Toggle in
+            // Form.
+            #if os(tvOS)
+            Toggle("Speak when a device starts moving", isOn: Binding(
+                get: { GuardianAudioAlertService.shared.isEnabled },
+                set: { GuardianAudioAlertService.shared.isEnabled = $0 }
+            ))
+            Text("Announces the device's nickname aloud when new fixes arrive after a period of stillness. Balloons still show even when speak is off.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            #else
             Toggle(isOn: Binding(
                 get: { GuardianAudioAlertService.shared.isEnabled },
                 set: { GuardianAudioAlertService.shared.isEnabled = $0 }
             )) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Speak when a device starts moving")
-                    Text("Announces the device's nickname aloud when new fixes arrive after a period of stillness.")
+                    Text("Announces the device's nickname aloud when new fixes arrive after a period of stillness. Balloons still show even when speak is off.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
             }
+            #endif
+
+            // Diagnostic escape hatch. If persisted state has
+            // drifted into "keeps replaying the same events" (or
+            // conversely "won't announce anything") territory,
+            // wiping resets every profile's state machine + trip
+            // log so the next fix from each Minor re-seeds cleanly.
+            // No confirmation dialog on tvOS because the tvOS Form
+            // stack can't gracefully host one; a stray click here
+            // is cheap to recover from anyway (state re-seeds
+            // silently on the next fix).
+            Button(role: .destructive) {
+                GuardianAudioAlertService.shared.resetAllAnnouncementState()
+            } label: {
+                Label("Reset alert state", systemImage: "arrow.counterclockwise")
+            }
         } header: {
             Text("Family alerts")
         } footer: {
-            Text("Edit each device's spoken nickname from the Family tab → tap a device.")
+            Text("Edit each device's spoken nickname from the Family tab → tap a device. Reset alert state clears trip counters + \"back online\" tracking if announcements start repeating or fall silent.")
                 .font(.footnote)
         }
     }
@@ -257,6 +464,107 @@ struct SettingsView: View {
     }
     #endif
 
+    #if os(iOS)
+    @ObservedObject private var launchReminder = LaunchReminderService.shared
+
+    private var launchReminderSection: some View {
+        Section {
+            Toggle("Remind me to open MapMe", isOn: $launchReminder.isEnabled)
+            if launchReminder.isEnabled {
+                Stepper(value: $launchReminder.reminderHour, in: 1...23) {
+                    Text("Daily reminder at \(hourLabel(launchReminder.reminderHour))")
+                }
+            }
+        } header: {
+            Text("Reminders")
+        } footer: {
+            Text("Fires a local notification once a day (unless you opened MapMe in the last 4 hours), and again when your phone detects you've started moving without tracking on. Movement wake needs ‘Always’ location permission.")
+                .font(.caption2)
+        }
+    }
+
+    private func hourLabel(_ h: Int) -> String {
+        var comps = DateComponents()
+        comps.hour = h
+        comps.minute = 0
+        let cal = Calendar.current
+        let date = cal.date(from: comps) ?? Date()
+        let fmt = DateFormatter()
+        fmt.timeStyle = .short
+        return fmt.string(from: date)
+    }
+    #endif
+
+    // MARK: - Guardian sync diagnostics
+    //
+    // Per-paired-device readout so a "device isn't showing active"
+    // report can be triaged without a debugger. For each MinorProfile
+    // in the shared store: display name, total record count, most
+    // recent record timestamp. If a device is paired but its record
+    // count is 0 or its latest timestamp is hours old, it's a sync
+    // problem on the Minor side (or the CKShare is broken); if it's
+    // recent, the problem is the freshness display, not the data.
+
+    @FetchRequest(
+        sortDescriptors: [NSSortDescriptor(key: "displayName", ascending: true)],
+        animation: .default
+    ) private var diagProfiles: FetchedResults<MinorProfile>
+
+    @ViewBuilder
+    private var guardianSyncDiagnosticsSection: some View {
+        if !diagProfiles.isEmpty {
+            Section {
+                ForEach(diagProfiles, id: \.objectID) { profile in
+                    let (ts, count) = profileSyncStats(for: profile)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(profile.displayName ?? "Unknown device")
+                            .font(.callout.weight(.medium))
+                        HStack(spacing: 6) {
+                            Text("\(count) fix\(count == 1 ? "" : "es")")
+                            Text("·")
+                                .foregroundStyle(.tertiary)
+                            Text(latestFixLabel(ts))
+                        }
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 2)
+                }
+            } header: {
+                Text("Sync diagnostics")
+            } footer: {
+                Text("Per paired device. 0 fixes means this Guardian has never received a record from the device — the device's Invite Guardian flow was probably never run + accepted here. Old timestamp means the Minor stopped uploading (out of range, low battery, or a stalled CloudKit queue).")
+                    .font(.caption2)
+            }
+        }
+    }
+
+    /// Fetches (latest timestamp, total record count) for a paired
+    /// device. Both are cheap SQLite reads — `fetchLimit=1` +
+    /// `count(for:)`. No rows are hydrated for the count.
+    private func profileSyncStats(for profile: MinorProfile) -> (Date?, Int) {
+        let ctx = ctx
+        let latestRequest = NSFetchRequest<LocationRecord>(entityName: "LocationRecord")
+        latestRequest.predicate = NSPredicate(format: "profile == %@", profile)
+        latestRequest.sortDescriptors = [NSSortDescriptor(key: "timestamp", ascending: false)]
+        latestRequest.fetchLimit = 1
+        let latest = (try? ctx.fetch(latestRequest).first)?.timestamp
+
+        let countRequest = NSFetchRequest<LocationRecord>(entityName: "LocationRecord")
+        countRequest.predicate = NSPredicate(format: "profile == %@", profile)
+        let count = (try? ctx.count(for: countRequest)) ?? 0
+        return (latest, count)
+    }
+
+    private func latestFixLabel(_ date: Date?) -> String {
+        guard let date else { return "no fixes yet" }
+        let elapsed = Date().timeIntervalSince(date)
+        if elapsed < 60 { return "\(Int(elapsed))s ago" }
+        if elapsed < 3600 { return "\(Int(elapsed / 60))m ago" }
+        if elapsed < 86400 { return "\(Int(elapsed / 3600))h ago" }
+        return "\(Int(elapsed / 86400))d ago"
+    }
+
     private var roleLabel: String {
         switch roleStore.role {
         case .unset:    return "Not set"
@@ -265,7 +573,7 @@ struct SettingsView: View {
         }
     }
 
-    #if os(iOS)
+    #if os(iOS) || os(macOS)
     private var authText: String {
         switch location.authorizationStatus {
         case .authorizedAlways: return "Always"

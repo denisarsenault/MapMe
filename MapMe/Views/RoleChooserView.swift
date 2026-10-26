@@ -56,5 +56,6 @@ struct RoleChooserView: View {
         .padding()
         .frame(maxWidth: 520)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+        .overlay(alignment: .bottom) { CopyrightFooter() }
     }
 }

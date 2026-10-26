@@ -11,6 +11,7 @@ struct WatchSettingsView: View {
 
     @StateObject private var sharing = SharingService()
     @ObservedObject private var snapService = SnapToRoadsService.shared
+    @ObservedObject private var launchReminder = LaunchReminderService.shared
 
     // Filter to *this watch's* MinorProfile only. Without this, CloudKit
     // sync of the paired iPhone's profile lands in our private store too,
@@ -82,6 +83,15 @@ struct WatchSettingsView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+
+                Toggle(isOn: $location.trackingChangeAlertsEnabled) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Notify me when it flips").font(.caption)
+                        Text("Haptic + banner every time Live tracking turns on or off, so you can tell auto-start actually fired.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             } header: {
                 Text("Motion")
             } footer: {
@@ -102,6 +112,52 @@ struct WatchSettingsView: View {
                     Button("Request access") { location.requestAuthorization() }
                         .font(.caption)
                 }
+            }
+
+            // Diagnostics — read-only counters so the wearer can tell
+            // whether the watch is even producing fixes when Guardian
+            // devices report they can't see the watch. If "Written
+            // today" is climbing, the problem is downstream (Guardian
+            // side); if it's stuck at 0, tracking never activated.
+            Section {
+                LabeledContent {
+                    Text(location.isLiveTracking ? "Live" : "Idle")
+                        .font(.caption2)
+                        .foregroundStyle(location.isLiveTracking ? .green : .secondary)
+                } label: {
+                    Text("Tracking").font(.caption)
+                }
+                LabeledContent {
+                    Text("\(location.recordsWrittenToday())")
+                        .font(.caption2.monospacedDigit())
+                } label: {
+                    Text("Written today").font(.caption)
+                }
+                LabeledContent {
+                    Text("\(location.pendingWriteCount)")
+                        .font(.caption2.monospacedDigit())
+                } label: {
+                    Text("Pending flush").font(.caption)
+                }
+                LabeledContent {
+                    Text(diagnosticsRelative(location.lastAcceptedFixTimestamp))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } label: {
+                    Text("Last fix").font(.caption)
+                }
+                LabeledContent {
+                    Text(diagnosticsRelative(location.lastPersistedAt))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } label: {
+                    Text("Last save").font(.caption)
+                }
+            } header: {
+                Text("Diagnostics")
+            } footer: {
+                Text("If Written today is climbing but Guardian devices don't see the watch, pairing may be missing on the Guardian side. If it's stuck at 0, tracking hasn't activated.")
+                    .font(.caption2)
             }
 
             Section {
@@ -192,6 +248,24 @@ struct WatchSettingsView: View {
                     .font(.caption2)
             }
 
+            Section {
+                Toggle(isOn: $launchReminder.isEnabled) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Remind me to open MapMe").font(.caption)
+                        Text("Daily notification (default 8:00) plus a wake-up prompt if you're moving with tracking off.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                if launchReminder.isEnabled {
+                    Stepper(value: $launchReminder.reminderHour, in: 1...23) {
+                        Text("At \(launchReminder.reminderHour):00").font(.caption)
+                    }
+                }
+            } header: {
+                Text("Reminders")
+            }
+
             Section("Lock") {
                 Button("Lock now") { auth.lock() }
                     .font(.caption)
@@ -207,6 +281,7 @@ struct WatchSettingsView: View {
             }
         }
         .navigationTitle("Settings")
+        .mapMeWatchBrand("Settings")
         // Re-check on every appearance so the nudge clears as soon as the
         // user comes back from adding the complication to their face.
         .onAppear { checkComplicationStatus() }
@@ -405,5 +480,18 @@ struct WatchSettingsView: View {
         case .notDetermined: return "Not set"
         @unknown default: return "Unknown"
         }
+    }
+
+    /// Compact relative-time string for the diagnostics rows.
+    /// "12s", "4m", "2h", or "—" for nil. Deliberately terser than
+    /// `Date.RelativeFormatStyle` since the watch Settings column is
+    /// narrow and "12 seconds ago" would wrap.
+    private func diagnosticsRelative(_ date: Date?) -> String {
+        guard let date else { return "—" }
+        let elapsed = Date().timeIntervalSince(date)
+        if elapsed < 60 { return "\(Int(elapsed))s" }
+        if elapsed < 3600 { return "\(Int(elapsed / 60))m" }
+        if elapsed < 86400 { return "\(Int(elapsed / 3600))h" }
+        return "\(Int(elapsed / 86400))d"
     }
 }

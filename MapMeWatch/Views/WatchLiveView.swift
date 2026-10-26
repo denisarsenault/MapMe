@@ -66,6 +66,13 @@ struct WatchLiveView: View {
                         if let err = location.trackingError {
                             Text(err).font(.caption2).foregroundStyle(.red)
                         }
+                        // Siri hint chip — inline in the scrollable
+                        // section so it doesn't eat any of the fixed
+                        // status/map space above. Dismissible.
+                        WatchSiriTip(
+                            intent: WatchStartLiveTrackingIntent(),
+                            storageKey: "MapMe.siriTip.watchLive"
+                        )
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 4)
@@ -73,6 +80,7 @@ struct WatchLiveView: View {
             }
         }
         .navigationTitle("Live")
+        .mapMeWatchBrand("Live")
         .task { location.requestAuthorization() }
     }
 

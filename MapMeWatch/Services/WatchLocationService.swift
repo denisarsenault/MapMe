@@ -107,6 +107,46 @@ final class WatchLocationService: NSObject, ObservableObject {
 
     private var motionCancellable: AnyCancellable?
 
+    /// When on, WatchLocationService posts a local notification +
+    /// plays a haptic every time Live tracking transitions on/off —
+    /// including the auto-start-on-motion path, so the user can tell
+    /// the feature actually fired. Without this the transition is
+    /// invisible unless the user opens the app and looks at the
+    /// "Live" pill. Default `true` because the whole point of the
+    /// auto-start feature is to run in the background and the user
+    /// needs a signal.
+    @Published var trackingChangeAlertsEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(trackingChangeAlertsEnabled,
+                                      forKey: Self.kTrackingChangeAlertsKey)
+        }
+    }
+    private static let kTrackingChangeAlertsKey = "MapMe.trackingChangeAlerts"
+
+    /// When on, the watch tries to maintain a live `HKWorkoutSession`
+    /// continuously — auto-starts on app launch, auto-restarts if the
+    /// session dies, and ignores the auto-stop-when-stationary path.
+    ///
+    /// This is the "always-on tracking" mode requested to eliminate
+    /// the 15-min background-refresh wake-up gap. Battery cost with
+    /// the current Balanced profile is ~10-14% per hour on a Series 6+
+    /// (Apple Watch screen off, GPS active, no cellular). Users who
+    /// want the old manual behaviour can turn this off in the watch
+    /// Settings screen.
+    ///
+    /// Default `true` — the user asked for always-on to be the
+    /// default. A dedicated toggle in `WatchSettingsView` lets them
+    /// opt out for battery-critical days.
+    @Published var alwaysOnTracking: Bool {
+        didSet {
+            UserDefaults.standard.set(alwaysOnTracking, forKey: Self.kAlwaysOnKey)
+            if alwaysOnTracking {
+                ensureLiveTracking()
+            }
+        }
+    }
+    private static let kAlwaysOnKey = "MapMe.watchAlwaysOnTracking"
+
     private let manager = CLLocationManager()
     private let persistence: PersistenceController
     private let healthStore = HKHealthStore()
@@ -133,6 +173,127 @@ final class WatchLocationService: NSObject, ObservableObject {
     /// teleport guard in `persist` — see the matching field +
     /// thresholds on iOS' `LocationService` for the rationale.
     private var lastAcceptedLocation: CLLocation?
+    /// Set true when `beginStreaming()` flips intent to Live. The
+    /// tracking-started haptic + notification only fires once a
+    /// *real* CL fix arrives after this flag is set — previously
+    /// we announced the moment CL was asked to stream, which is
+    /// before the HK workout session has confirmed `.running` and
+    /// before any fix has been delivered. If the host silently fails
+    /// to reach `.running`, the wearer saw "tracking started" but
+    /// the watch never actually recorded anything.
+    private var pendingStartAnnounceOnFirstFix: Bool = false
+    /// When `beginStreaming()` last ran. Kept for diagnostics but no
+    /// longer used to trigger a zombie-repair — the "no fix since
+    /// start" heuristic proved too eager (indoors, cold-start fixes
+    /// can take several minutes) and re-cycled the HK workout
+    /// session repeatedly, which drained battery and spammed
+    /// tracking-change notifications on every 15-min background
+    /// refresh. Only a truly dead host (both `workoutSession` and
+    /// `runtimeSession` nil) counts as zombie now.
+    private var lastBeginStreamingAt: Date?
+    /// When we last did a zombie-repair `stop → start` cycle. Rate-
+    /// limit further cycles so a broken environment (permission
+    /// revoked, HK unavailable) doesn't burn the battery in a tight
+    /// retry loop.
+    private var lastZombieRecycleAt: Date?
+    /// Minimum spacing between zombie-repair cycles.
+    private static let zombieRecycleCooldown: TimeInterval = 5 * 60
+    /// How long we wait for the HK workout session to transition
+    /// to `.running` before assuming it silently failed and falling
+    /// back to `WKExtendedRuntimeSession`.
+    private static let hkRunningWatchdogSeconds: TimeInterval = 10
+
+    // MARK: - Batched writes
+    //
+    // Same rationale as `LocationService.PendingWrite` on iOS — one
+    // CloudKit export op per batch instead of one per fix, which
+    // matters even more on watchOS given the tiny background runtime
+    // budget. See the iOS twin for the full write-up.
+    private struct PendingWrite {
+        let timestamp: Date
+        let latitude: Double
+        let longitude: Double
+        let altitude: Double
+        let speed: Double
+        let course: Double
+        let horizontalAccuracy: Double
+        let verticalAccuracy: Double
+    }
+    private var pendingWrites: [PendingWrite] = []
+
+    // MARK: - Diagnostics (read-only accessors for Settings)
+    //
+    // The wearer needs a way to tell whether "MapMe is tracking me"
+    // and "Guardian isn't seeing me" are the same problem or two
+    // different ones. If `recordsWrittenToday()` is climbing and
+    // `pendingWriteCount` stays small, the watch IS producing +
+    // saving fixes and the issue is downstream (share missing on the
+    // Guardian side, or CloudKit sync stalled). If `recordsWrittenToday`
+    // is zero, tracking never activated and the problem is on this
+    // device.
+
+    /// Number of accepted fixes currently buffered locally, waiting
+    /// for the next `flushPendingWrites` cycle to save them to Core
+    /// Data. `nonisolated` so the SwiftUI Settings view can read it
+    /// without an actor hop mid-render.
+    var pendingWriteCount: Int { pendingWrites.count }
+
+    /// Timestamp of the newest CL fix that passed our accuracy /
+    /// staleness / teleport filters. `nil` before the first fix.
+    /// Used by the diagnostics row so the wearer can see "watch got
+    /// a fix 12 s ago" vs "watch hasn't seen a fix in 40 min."
+    var lastAcceptedFixTimestamp: Date? { lastAcceptedLocation?.timestamp }
+
+    /// When we last actually wrote a record to Core Data (heartbeat
+    /// or accepted fix). `nil` before the first save.
+    var lastPersistedAt: Date? { lastWriteAt }
+
+    /// Counts today's `LocationRecord` rows written by this watch
+    /// (matched by `deviceIdentifier`). Runs a `count(for:)` — no
+    /// rows hydrated — so it's cheap enough to call on every Settings
+    /// render.
+    func recordsWrittenToday() -> Int {
+        let ctx = persistence.container.viewContext
+        let request = NSFetchRequest<LocationRecord>(entityName: "LocationRecord")
+        let startOfDay = Calendar.current.startOfDay(for: Date())
+        request.predicate = NSPredicate(
+            format: "deviceIdentifier == %@ AND timestamp >= %@",
+            DeviceID.current, startOfDay as NSDate
+        )
+        return (try? ctx.count(for: request)) ?? 0
+    }
+    /// Fixes buffered before a Core Data save flushes. Was 3, dropped
+    /// to 2 after Guardian users reported the watch marker lagging
+    /// several minutes behind reality on Live mode — 3 × 60 s
+    /// cadence = up to 3 min in the buffer before flush. 2 halves
+    /// that and still keeps CloudKit export ops well under the
+    /// scheduler backlog threshold.
+    private static let writeBatchSize: Int = 2
+    /// Periodic drain even if the buffer hasn't filled. Was 300 s
+    /// (5 min) — dropped to 60 s so no accepted fix waits more
+    /// than a minute in the buffer, capping the "not tweening
+    /// because no fresh data" period the Guardian sees.
+    private static let flushIntervalSeconds: TimeInterval = 60
+    private var flushTimer: Timer?
+
+    /// Minimum spacing between motion-triggered immediate flushes.
+    /// Every accepted moving fix used to flush right away —
+    /// that fired an unbounded number of CloudKit export ops per
+    /// minute and tripped `BGSystemTaskSchedulerErrorDomain
+    /// Code=3` (too many pending task requests). 15 s caps the
+    /// export rate at ~4/min while keeping Live-view latency
+    /// perceptually seconds-not-minutes.
+    private static let motionFlushMinSpacing: TimeInterval = 15
+    private var lastMotionFlushAt: Date?
+
+    // Stationary heartbeat — see the iOS `LocationService` twin for
+    // the full rationale. TL;DR: a genuinely stationary device stops
+    // writing fixes (cluster filter rejects them), so the Guardian's
+    // "online" dot goes grey after 30 min even though the device is
+    // fine. This timer emits a synthetic record every ~15 min at
+    // the last-known coordinate so the freshness clock stays alive.
+    private static let heartbeatIntervalSeconds: TimeInterval = 15 * 60
+    private var heartbeatTimer: Timer?
     /// Rolling window of recently accepted fixes, used by the
     /// stationary cluster suppressor. Capped at
     /// `stationaryClusterWindow`.
@@ -155,11 +316,14 @@ final class WatchLocationService: NSObject, ObservableObject {
     private static let maxHorizontalAccuracyMeters: CLLocationDistance = 300
     private static let maxFixStalenessSeconds: TimeInterval = 30
     private static let maxRealisticSpeedKmh: Double = 250
-    /// Stationary jitter thresholds — see the matching constants on
-    /// iOS' `LocationService`. Identical values so a paired phone /
-    /// watch produce comparable trails when both are recording.
+    /// Stationary jitter thresholds. Wider than the iPhone twin
+    /// (12 m vs 8 m) because wrist-mounted GPS has structurally more
+    /// noise: smaller antenna, arm-motion obstruction, and body-
+    /// worn thermal drift. The tighter iPhone floor over-triggered
+    /// the "moving" branch and produced zigzag scribble around
+    /// stationary rest locations on the watch.
     private static let stationarySpeedKmh: Double = 0.5
-    private static let stationaryJitterFloorMeters: CLLocationDistance = 8
+    private static let stationaryJitterFloorMeters: CLLocationDistance = 12
     /// Distance-based cadence bypass — see comment on the iOS twin.
     /// Without this, parking-lot crawls (<90 s through the lot) lose
     /// every intermediate fix to the cadence coalescer.
@@ -168,9 +332,24 @@ final class WatchLocationService: NSObject, ObservableObject {
     /// Stationary cluster suppressor — see iOS twin. Watch GPS jitter
     /// is typically worse than iPhone (smaller antenna, wrist
     /// obstruction), so this filter is what actually stops the
-    /// scribble around a stationary rest location.
-    private static let stationaryClusterRadiusMeters: CLLocationDistance = 25
+    /// scribble around a stationary rest location. 40 m (up from
+    /// iOS' 25 m) matches the wider jitter budget the wrist-
+    /// mounted radio needs.
+    private static let stationaryClusterRadiusMeters: CLLocationDistance = 40
     private static let stationaryClusterWindow: Int = 5
+
+    /// Watch-side minimum write interval per PowerProfile. Denser than
+    /// the shared `PowerProfile.minimumWriteIntervalSeconds` because
+    /// snap-to-roads on the watch needs closer waypoints to avoid
+    /// dashed-fallback segments. See the call site in `persist(_:)`
+    /// for the trade-off analysis.
+    private static func watchOverriddenInterval(for profile: PowerProfile) -> TimeInterval {
+        switch profile {
+        case .battery:      return 300  // unchanged — battery mode stays coarse on purpose
+        case .balanced:     return 60   // was 90 (from PowerProfile) — tighter for snap density
+        case .highAccuracy: return 20   // was 30 — even denser under HighAccuracy
+        }
+    }
 
     private init(persistence: PersistenceController = .shared) {
         self.persistence = persistence
@@ -185,6 +364,18 @@ final class WatchLocationService: NSObject, ObservableObject {
             UserDefaults.standard.set(true, forKey: Self.kAutoStartOnMotionKey)
         }
         self.autoStartOnMotion = UserDefaults.standard.bool(forKey: Self.kAutoStartOnMotionKey)
+        // Same first-launch defaulting for tracking-change alerts.
+        if UserDefaults.standard.object(forKey: Self.kTrackingChangeAlertsKey) == nil {
+            UserDefaults.standard.set(true, forKey: Self.kTrackingChangeAlertsKey)
+        }
+        self.trackingChangeAlertsEnabled = UserDefaults.standard.bool(forKey: Self.kTrackingChangeAlertsKey)
+        // Always-on defaults to `true` — the user's stated goal is
+        // "keep it on and active all the time". Users can opt out
+        // from `WatchSettingsView` for a battery-critical day.
+        if UserDefaults.standard.object(forKey: Self.kAlwaysOnKey) == nil {
+            UserDefaults.standard.set(true, forKey: Self.kAlwaysOnKey)
+        }
+        self.alwaysOnTracking = UserDefaults.standard.bool(forKey: Self.kAlwaysOnKey)
         super.init()
         manager.delegate = self
         // Apply the loaded profile to the CL manager. `applyPowerProfile()`
@@ -205,6 +396,32 @@ final class WatchLocationService: NSObject, ObservableObject {
         // value on the next run-loop tick.
 
         observeRemoteChanges()
+        // Low-power-mode observer. When the watch's battery hits
+        // reserve capacity, watchOS enters Reserve Mode — apps get
+        // suspended, tracking sessions get torn down, background
+        // refresh queue gets cleared. When the user charges back
+        // up and Reserve Mode exits, `NSProcessInfoPowerStateDidChange`
+        // fires. That's the moment to (a) re-arm Live tracking
+        // via `ensureLiveTracking` and (b) push an immediate
+        // heartbeat so Guardian devices see "I'm back" without
+        // waiting up to 15 min for the next scheduled beat.
+        NotificationCenter.default.addObserver(
+            forName: .NSProcessInfoPowerStateDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            // Only act when the transition is low-power → normal.
+            // Low-power → low-power (unchanged) is a no-op; we
+            // don't want to double-start on every notification.
+            if !ProcessInfo.processInfo.isLowPowerModeEnabled {
+                Task { @MainActor in
+                    self.ensureLiveTracking()
+                    self.writeHeartbeatIfIdle()
+                }
+            }
+        }
+
         // Wire the shared motion classifier. Even if the user has
         // `autoStartOnMotion` off, we let the monitor run so a later
         // toggle-on has fresh data. The subscription is guarded — we
@@ -239,13 +456,59 @@ final class WatchLocationService: NSObject, ObservableObject {
         if moving {
             lastMotionAt = Date()
             if !isLiveTracking { startLiveTracking() }
+            // Motion resumed — escalate GPS accuracy immediately so
+            // the first fix after a rest is precise. Cost of running
+            // Best is only paid while actually moving.
+            applyDynamicAccuracy(stationary: false)
         } else {
             // Stationary. Debounce the auto-stop so a brief pause
             // doesn't tear down the workout session.
+            //
+            // When `alwaysOnTracking` is ON, skip the auto-stop
+            // entirely — the whole point of always-on is that Live
+            // never gets torn down for stationary periods. Instead
+            // we take the battery win by widening `desiredAccuracy`
+            // + `distanceFilter` — GPS radio still runs but the
+            // ranging duty cycle drops sharply once CL knows we
+            // don't need sub-100 m fidelity.
+            if alwaysOnTracking {
+                applyDynamicAccuracy(stationary: true)
+                return
+            }
             let sinceLast = lastMotionAt.map { Date().timeIntervalSince($0) } ?? 0
             if isLiveTracking, sinceLast >= Self.autoStopStationaryInterval {
                 stopLiveTracking()
             }
+        }
+    }
+
+    /// Adjusts the CL manager for the current motion state.
+    ///
+    /// - Moving → `powerProfile`'s desired accuracy + a tight
+    ///   `distanceFilter` (20 m ≈ 65 ft). PowerProfile's default
+    ///   filter is 100 m on Balanced, which meant CL wouldn't
+    ///   deliver a new fix until the watch had travelled a full
+    ///   100 m — the Guardian's Live view saw nothing until the
+    ///   wearer had covered ~330 ft. 20 m lets updates flow every
+    ///   ~65 ft of movement, comfortably inside the user's 200 ft
+    ///   "should be real-time" expectation.
+    /// - Stationary (and always-on) → `hundredMeters` + `100 m`
+    ///   filter. GPS ranging drops from ~1 Hz to opportunistic;
+    ///   sub-100 m precision is meaningless when the fix hasn't
+    ///   moved anyway.
+    ///
+    /// Ignored when `alwaysOnTracking` is off — in the manual-control
+    /// world, the profile the user picked is authoritative.
+    private static let movingDistanceFilterMeters: CLLocationDistance = 20
+
+    private func applyDynamicAccuracy(stationary: Bool) {
+        guard alwaysOnTracking else { return }
+        if stationary {
+            manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
+            manager.distanceFilter = 100
+        } else {
+            manager.desiredAccuracy = powerProfile.desiredAccuracy
+            manager.distanceFilter = Self.movingDistanceFilterMeters
         }
     }
 
@@ -346,26 +609,45 @@ final class WatchLocationService: NSObject, ObservableObject {
         // app has runtime budget before we start streaming CL fixes.
         // Both paths mark `isLiveTracking = true` and call
         // `beginStreaming()`.
-        if HKHealthStore.isHealthDataAvailable() {
-            // Ask for an *empty* share/read set — `HKWorkoutSession`
-            // requires authorization to have happened, but we don't
-            // actually want any types. An empty share set is treated
-            // as "no access requested," which is exactly right since
-            // we never read or write samples.
+        guard HKHealthStore.isHealthDataAvailable() else {
+            // No HealthKit on this device (shouldn't happen on a
+            // modern Apple Watch, but the simulator can land here).
+            startRuntimeSessionFallback()
+            return
+        }
+
+        // Fast path: don't call `requestAuthorization` if the user
+        // already granted (or explicitly denied). Two reasons:
+        //   1. On a locked watch, `requestAuthorization` can defer
+        //      its completion callback until unlock — turning
+        //      "always-on tracking" into "tracking that never
+        //      starts if the watch was locked when it was asked to
+        //      start", which matches the wearer's report of a
+        //      1.5-mile walk with zero fixes recorded.
+        //   2. The prompt-dialog case only exists on the very first
+        //      run; after that `.sharingAuthorized` / `.sharingDenied`
+        //      is stable and re-asking wastes a runloop hop.
+        let hkStatus = healthStore.authorizationStatus(for: HKObjectType.workoutType())
+        switch hkStatus {
+        case .sharingAuthorized:
+            startWorkoutSession()
+        case .sharingDenied:
+            startRuntimeSessionFallback()
+        case .notDetermined:
+            // First run — ask, then dispatch on the callback. The
+            // dialog only shows when the watch is unlocked; if the
+            // user is on a walk right now the callback won't fire
+            // until they unlock, which is the expected UX for a
+            // first-time permission prompt.
             healthStore.requestAuthorization(toShare: [HKObjectType.workoutType()],
                                              read: []) { [weak self] granted, _ in
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    if granted {
-                        self.startWorkoutSession()
-                    } else {
-                        self.startRuntimeSessionFallback()
-                    }
+                    if granted { self.startWorkoutSession() }
+                    else { self.startRuntimeSessionFallback() }
                 }
             }
-        } else {
-            // No HealthKit on this device (shouldn't happen on a
-            // modern Apple Watch, but the simulator can land here).
+        @unknown default:
             startRuntimeSessionFallback()
         }
     }
@@ -377,12 +659,36 @@ final class WatchLocationService: NSObject, ObservableObject {
     private func startWorkoutSession() {
         guard workoutSession == nil else { return }
         let config = HKWorkoutConfiguration()
-        config.activityType = .other
+        // `.walking` (not `.other`) is deliberate. watchOS grants
+        // `.walking` / `.running` / `.hiking` / `.cycling` real
+        // background-GPS priority — CL keeps delivering fixes even
+        // when the watch is locked or the wrist is down. `.other`
+        // is treated as a generic session and can lose GPS delivery
+        // to power management, which matched the wearer's report of
+        // a 1.5-mile walk producing zero recorded fixes because
+        // watchOS quietly suspended CL updates once the app went
+        // inactive. Health app impact is nil: `stopLiveTracking`
+        // calls `discardWorkout()` so no sample is ever saved.
+        config.activityType = .walking
         config.locationType = .outdoor
         do {
             let session = try HKWorkoutSession(healthStore: healthStore,
                                                configuration: config)
             let builder = session.associatedWorkoutBuilder()
+            // Data source is REQUIRED for `beginCollection` to succeed —
+            // without it, the builder can't start, `beginCollection`
+            // errors out, and the workout session gets invalidated by
+            // watchOS, which kills the runtime budget. A previous
+            // attempt to skip the data source (to keep the HR sensor
+            // asleep) had exactly this failure mode: the watch stopped
+            // getting GPS fixes, and Guardian devices saw the watch
+            // fall off the network entirely.
+            //
+            // Accepting the ~5-10 % / hr HR polling here — future
+            // optimisation is to call
+            // `dataSource.disableCollection(for: .heartRate)` etc.
+            // to suppress specific metric types while keeping the
+            // data source alive.
             builder.dataSource = HKLiveWorkoutDataSource(
                 healthStore: healthStore,
                 workoutConfiguration: config
@@ -399,6 +705,30 @@ final class WatchLocationService: NSObject, ObservableObject {
                 // builder is just plumbing. We ignore the error.
             }
             beginStreaming()
+            // Watchdog: if the session doesn't reach `.running`
+            // within 10 s, fall back to WKExtendedRuntimeSession.
+            // `.startActivity` is asynchronous and can silently
+            // fail to transition — the delegate's
+            // `didFailWithError` covers explicit failures, but
+            // stuck-in-`.preparing` cases have been observed on
+            // real watches when the session was requested while
+            // the watch was locked or another workout was running.
+            // Without this watchdog the wearer thinks tracking is
+            // up but the session never activates, CL loses
+            // background GPS priority, and no fixes flow.
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.hkRunningWatchdogSeconds) { [weak self, weak session] in
+                guard let self, let session,
+                      self.workoutSession === session,
+                      session.state != .running else { return }
+                // Still not running. Drop the HK ref and start the
+                // runtime fallback so we have SOMETHING keeping
+                // the app alive for CL.
+                self.workoutSession = nil
+                self.workoutBuilder = nil
+                if self.runtimeSession == nil {
+                    self.startRuntimeSessionFallback()
+                }
+            }
         } catch {
             // Workout-session start failed (HealthKit unavailable
             // mid-flight, or denied by Screen Time / corporate
@@ -431,9 +761,23 @@ final class WatchLocationService: NSObject, ObservableObject {
         // CL asserts at this point if the plist key is missing.
         manager.allowsBackgroundLocationUpdates = true
         manager.startUpdatingLocation()
+        let wasTracking = isLiveTracking
         isLiveTracking = true
         trackingError = nil
         mirrorStatusToAppGroup()
+        armHeartbeatTimer()
+        LaunchReminderService.setTrackingActive(true)
+        lastBeginStreamingAt = Date()
+        // Defer the "tracking started" haptic + notification until we
+        // actually receive a fix. Firing it here — before any fix
+        // arrives — is what produced the wearer's "notification says
+        // tracking, but nothing was moving on Guardian" report:
+        // `HKWorkoutSession.startActivity` is asynchronous and can
+        // silently fail to reach `.running`, at which point CL only
+        // delivers fixes while the app is foreground. Waiting for a
+        // real fix means the announce only fires when tracking is
+        // demonstrably working.
+        if !wasTracking { pendingStartAnnounceOnFirstFix = true }
     }
 
     func stopLiveTracking() {
@@ -460,8 +804,53 @@ final class WatchLocationService: NSObject, ObservableObject {
         workoutBuilder = nil
         runtimeSession = nil
 
+        let wasTracking = isLiveTracking
         isLiveTracking = false
+        pendingStartAnnounceOnFirstFix = false
+        lastBeginStreamingAt = nil
         mirrorStatusToAppGroup()
+        LaunchReminderService.setTrackingActive(false)
+        // Drain any fixes still buffered before we tear down. On the
+        // watch this matters a lot — a stopped session that's never
+        // flushed loses the tail permanently since there's no
+        // background wake-up to catch up later.
+        flushPendingWrites()
+        cancelFlushTimer()
+        cancelHeartbeatTimer()
+        if wasTracking { announceTrackingChange(started: false) }
+    }
+
+    // MARK: - Tracking-change alerts
+
+    /// Fires a haptic + local notification whenever Live tracking
+    /// transitions on/off. This is the visible / tactile signal that
+    /// the auto-start-on-motion feature actually kicked in — without
+    /// it the transition happens silently in the background and the
+    /// wearer never knows the state changed.
+    ///
+    /// Silent when `trackingChangeAlertsEnabled` is false (user opted
+    /// out) or when notifications are denied. The haptic still plays
+    /// so wristward-glance still tells you something happened.
+    private func announceTrackingChange(started: Bool) {
+        guard trackingChangeAlertsEnabled else { return }
+        // Skip during a zombie-repair recycle — the wearer's intent
+        // is still "keep tracking", the plumbing is just being
+        // renewed. See `ensureLiveTracking`.
+        guard !isRecycling else { return }
+        WKInterfaceDevice.current().play(started ? .start : .stop)
+
+        let content = UNMutableNotificationContent()
+        content.title = started ? "MapMe tracking started" : "MapMe tracking stopped"
+        content.body = started
+            ? "Your watch just started recording Live location."
+            : "Your watch stopped recording Live location."
+        content.sound = .default
+        let request = UNNotificationRequest(
+            identifier: "com.mapme.tracking-change-\(started ? "on" : "off")",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request)
     }
 
     // MARK: - App Group mirror (drives the complication)
@@ -490,7 +879,84 @@ final class WatchLocationService: NSObject, ObservableObject {
         // Arm if tracking is now eligible; the method cancels itself when
         // consent is revoked or authorization is missing.
         armTrackingWatchdog()
+        // If always-on is on and consent just became available, kick
+        // the tracking session immediately instead of waiting for a
+        // motion event.
+        ensureLiveTracking()
     }
+
+    /// Idempotent "start Live tracking if it should be running and
+    /// isn't." No-op when:
+    ///
+    /// - `alwaysOnTracking` is off (user opted for manual control)
+    /// - `isLiveTracking` is already true (nothing to do)
+    /// - consent hasn't been granted for this device's `MinorProfile`
+    /// - CoreLocation isn't yet authorized
+    ///
+    /// Safe to call as often as we want — the app delegate calls it
+    /// on every `applicationDidBecomeActive` so a session that got
+    /// torn down (workout ended by the user starting a real workout,
+    /// OS-side runtime reclamation, unlock-from-suspend after a
+    /// battery-out crash) revives the moment the app is next opened.
+    func ensureLiveTracking() {
+        guard alwaysOnTracking else { return }
+        guard isAuthorized else { return }
+        guard isConsentGranted() else { return }
+
+        // Fast path: not tracking → start.
+        if !isLiveTracking {
+            startLiveTracking()
+            return
+        }
+
+        // Zombie-state repair — very narrow. Only recycle when BOTH
+        // hosts are gone, which is the only genuinely broken shape
+        // (no HKWorkoutSession AND no WKExtendedRuntimeSession means
+        // the process has no background runtime, so CL will only
+        // fire while foreground).
+        //
+        // Earlier attempt also recycled on "no fix in 60 s since
+        // start", but that hit legitimate slow-cold-start cases
+        // indoors and burned the battery in a stop→start→new-HK-
+        // session loop every 15 min. Only the "both hosts nil"
+        // shape is a true zombie.
+        let hostIsDead = (workoutSession == nil && runtimeSession == nil)
+        guard hostIsDead else { return }
+
+        // Rate-limit: at most one recycle per `zombieRecycleCooldown`
+        // regardless of how many `applicationDidBecomeActive` /
+        // background-refresh calls come through, so a permanently-
+        // broken environment (permission revoked mid-session, HK
+        // disabled by parental controls) can't drain the battery in
+        // a tight retry loop.
+        if let last = lastZombieRecycleAt,
+           Date().timeIntervalSince(last) < Self.zombieRecycleCooldown {
+            return
+        }
+        lastZombieRecycleAt = Date()
+
+        // Silent recycle — we don't want a "tracking stopped" +
+        // "tracking started" notification pair every time we repair
+        // a dead host. The wearer's intent is still "keep tracking";
+        // this is just plumbing the OS asked us to redo.
+        // `isRecycling` gates both `announceTrackingChange` and the
+        // deferred first-fix announce below.
+        isRecycling = true
+        stopLiveTracking()
+        startLiveTracking()
+        isRecycling = false
+        // Suppress the deferred first-fix announce too — startLive
+        // above already set the flag, but we clear it because a
+        // recycle should be invisible to the wearer.
+        pendingStartAnnounceOnFirstFix = false
+    }
+
+    /// True only for the tiny window inside `ensureLiveTracking`'s
+    /// zombie-repair path where a `stop → start` cycle would
+    /// otherwise fire "tracking stopped" + "tracking started"
+    /// notifications back-to-back. `announceTrackingChange` skips
+    /// when this is set.
+    private var isRecycling: Bool = false
 
     // MARK: - Tracking-paused watchdog
 
@@ -670,9 +1136,18 @@ final class WatchLocationService: NSObject, ObservableObject {
         //      role.
         let speedKmh = max(0, location.speed) * 3.6
         let adaptive = AdaptiveSamplingConfig.shared
+        // Watch-specific cadence: denser than iPhone's default so
+        // MKDirections has enough intermediate fixes to snap the
+        // walking polyline end-to-end (below `maxWalkingSnapDistanceMeters`).
+        // At 90 s of walking pace ~= 100 m per gap, which sits right
+        // at snap's fallback boundary and produced the dashed
+        // segments in the earlier watch trail. 60 s ~= 65 m gaps —
+        // comfortably inside the snap window. Battery hit is modest
+        // (~2-3 %/hr extra) and stays within the "Balanced always-on"
+        // envelope.
         let minInterval = adaptive.isEnabled
             ? adaptive.interval(forSpeedKmh: speedKmh)
-            : powerProfile.minimumWriteIntervalSeconds
+            : Self.watchOverriddenInterval(for: powerProfile)
 
         // Distance-based cadence bypass — mirror of the iOS twin.
         // Slow movement that takes longer than the cadence interval
@@ -731,14 +1206,85 @@ final class WatchLocationService: NSObject, ObservableObject {
         // forward so it only fires if fixes actually stop coming.
         armTrackingWatchdog()
 
-        let liveSnapshot = isLiveTracking
+        // Buffer instead of writing immediately — see the batching
+        // block at the top of the file for CloudKit-scheduler rationale.
+        pendingWrites.append(PendingWrite(
+            timestamp: location.timestamp,
+            latitude: location.coordinate.latitude,
+            longitude: location.coordinate.longitude,
+            altitude: location.altitude,
+            speed: location.speed,
+            course: location.course,
+            horizontalAccuracy: location.horizontalAccuracy,
+            verticalAccuracy: location.verticalAccuracy
+        ))
+        armFlushTimer()
+        // Motion-triggered immediate flush, rate-limited to at
+        // most once per `motionFlushMinSpacing`. Without the rate
+        // limit, one CloudKit export op per moving fix overwhelmed
+        // the BGTaskScheduler (Code=3 "too many pending"). 15 s
+        // spacing caps the export rate at ~4/min while keeping
+        // Live-view latency in the seconds range.
+        if speedKmh > Self.stationarySpeedKmh {
+            let now = Date()
+            let elapsed = lastMotionFlushAt.map { now.timeIntervalSince($0) } ?? .infinity
+            if elapsed >= Self.motionFlushMinSpacing {
+                lastMotionFlushAt = now
+                flushPendingWrites()
+            } else if pendingWrites.count >= Self.writeBatchSize {
+                flushPendingWrites()
+            }
+        } else if pendingWrites.count >= Self.writeBatchSize {
+            flushPendingWrites()
+        }
+
+        // App-Group mirror happens on every accepted fix so the
+        // complication reads the freshest coordinate the moment it
+        // renders. Widget timeline refresh is THROTTLED because
+        // `WidgetCenter.reloadTimelines` triggers a WidgetKit
+        // rendering pass every call — at HighAccuracy 30 s cadence
+        // that's 120 renders per hour, and each render pulls a fresh
+        // snapshot from the App Group + evaluates the timeline. 30 s
+        // throttle preserves the "Live · N m ago" feel without
+        // paying for 4× more widget renders than needed.
+        WatchSharedState.writeFix(location, isLive: isLiveTracking)
+        throttledWidgetReload()
+    }
+
+    /// Timestamp of the last `WidgetCenter.reloadTimelines` we let
+    /// through. `nil` on first fire.
+    private var lastWidgetReloadAt: Date?
+    private static let widgetReloadMinInterval: TimeInterval = 30
+
+    private func throttledWidgetReload() {
+        let now = Date()
+        if let last = lastWidgetReloadAt,
+           now.timeIntervalSince(last) < Self.widgetReloadMinInterval {
+            return
+        }
+        lastWidgetReloadAt = now
+        WidgetCenter.shared.reloadTimelines(ofKind: "com.mapme.app.status")
+    }
+
+    // MARK: - Batched write flush
+
+    /// Same rationale as `LocationService.flushPendingWrites` on iOS —
+    /// N accepted fixes ride ONE `ctx.save()` so CloudKit sees one
+    /// export op per batch instead of one per fix. On watchOS this
+    /// matters even more: the watch has severe background runtime
+    /// limits, so if CloudKit exports back up beyond what one refresh
+    /// window can drain, writes pile forever.
+    ///
+    /// `internal` (not `private`) so `WatchAppDelegate.applicationWillResignActive`
+    /// can drain the buffer on wrist-down / suspend transitions.
+    func flushPendingWrites() {
+        guard !pendingWrites.isEmpty else { return }
+        let batch = pendingWrites
+        pendingWrites.removeAll()
+
         let ctx = persistence.newBackgroundContext()
         let privateStore = persistence.privateStore
         ctx.perform {
-            // Scope to the private store. Records arriving from accepted
-            // CKShares live in the shared store and must not influence the
-            // Minor's writes here. Also filter by THIS device's identifier
-            // so the watch's records always attach to the watch's profile.
             let request = NSFetchRequest<MinorProfile>(entityName: "MinorProfile")
             request.predicate = NSPredicate(
                 format: "deviceIdentifier == %@", DeviceID.current
@@ -750,31 +1296,81 @@ final class WatchLocationService: NSObject, ObservableObject {
                 return
             }
 
-            let record = LocationRecord(context: ctx)
-            // Pin to the private store before relationships are wired —
-            // otherwise CoreData refuses the save with NSCocoaError 134020.
-            if let privateStore {
-                ctx.assign(record, to: privateStore)
+            for draft in batch {
+                let record = LocationRecord(context: ctx)
+                if let privateStore {
+                    ctx.assign(record, to: privateStore)
+                }
+                record.id = UUID()
+                record.timestamp = draft.timestamp
+                record.latitude = draft.latitude
+                record.longitude = draft.longitude
+                record.altitude = draft.altitude
+                record.speed = draft.speed
+                record.course = draft.course
+                record.horizontalAccuracy = draft.horizontalAccuracy
+                record.verticalAccuracy = draft.verticalAccuracy
+                record.deviceName = DeviceID.displayName
+                record.deviceIdentifier = DeviceID.current
+                if let profile { record.profile = profile }
             }
-            record.id = UUID()
-            record.timestamp = location.timestamp
-            record.latitude = location.coordinate.latitude
-            record.longitude = location.coordinate.longitude
-            record.altitude = location.altitude
-            record.speed = location.speed
-            record.course = location.course
-            record.horizontalAccuracy = location.horizontalAccuracy
-            record.verticalAccuracy = location.verticalAccuracy
-            record.deviceName = DeviceID.displayName
-            record.deviceIdentifier = DeviceID.current
-            if let profile { record.profile = profile }
             try? ctx.save()
-
-            // Mirror the latest fix into the App Group so the complication
-            // can render "Live · 3 m" without spinning up Core Data.
-            WatchSharedState.writeFix(location, isLive: liveSnapshot)
-            WidgetCenter.shared.reloadTimelines(ofKind: "com.mapme.app.status")
         }
+    }
+
+    private func armFlushTimer() {
+        guard flushTimer == nil else { return }
+        flushTimer = Timer.scheduledTimer(withTimeInterval: Self.flushIntervalSeconds,
+                                          repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.flushPendingWrites()
+            }
+        }
+    }
+
+    private func cancelFlushTimer() {
+        flushTimer?.invalidate()
+        flushTimer = nil
+    }
+
+    // MARK: - Heartbeat
+
+    private func armHeartbeatTimer() {
+        guard heartbeatTimer == nil else { return }
+        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: Self.heartbeatIntervalSeconds,
+                                              repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.writeHeartbeatIfIdle()
+            }
+        }
+    }
+
+    private func cancelHeartbeatTimer() {
+        heartbeatTimer?.invalidate()
+        heartbeatTimer = nil
+    }
+
+    /// Synthetic record at the last-known coordinate — see iOS
+    /// twin for the full rationale.
+    private func writeHeartbeatIfIdle() {
+        guard isLiveTracking else { return }
+        guard let last = lastAcceptedLocation else { return }
+        if let lw = lastWriteAt,
+           Date().timeIntervalSince(lw) < Self.heartbeatIntervalSeconds {
+            return
+        }
+        pendingWrites.append(PendingWrite(
+            timestamp: Date(),
+            latitude: last.coordinate.latitude,
+            longitude: last.coordinate.longitude,
+            altitude: last.altitude,
+            speed: 0,
+            course: -1,
+            horizontalAccuracy: last.horizontalAccuracy,
+            verticalAccuracy: last.verticalAccuracy
+        ))
+        lastWriteAt = Date()
+        flushPendingWrites()
     }
 }
 
@@ -801,6 +1397,15 @@ extension WatchLocationService: CLLocationManagerDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.lastLocation = location
+            // First real fix after a start? Fire the deferred
+            // "tracking started" announce now — this is the point at
+            // which we can honestly tell the wearer tracking is
+            // working. Any earlier and we're announcing intent, not
+            // reality. See `beginStreaming()` for the reasoning.
+            if self.pendingStartAnnounceOnFirstFix {
+                self.pendingStartAnnounceOnFirstFix = false
+                self.announceTrackingChange(started: true)
+            }
             self.persist(location)
             if let cb = self.oneShotCompletion {
                 self.oneShotCompletion = nil

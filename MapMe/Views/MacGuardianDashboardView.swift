@@ -43,6 +43,14 @@ struct MacGuardianDashboardView: View {
     @State private var deleteError: String?
     @State private var isDeleting = false
 
+    /// One-shot Mac-device location fetch. Feeds
+    /// `WorldMapView.fallbackCenter` so a fresh install with no
+    /// Minor records yet still lands the camera on a useful spot.
+    /// macOS `CLLocationManager.requestLocation()` prompts the user
+    /// once via the standard system dialog; if they decline, the
+    /// helper stays silent and the map falls back to `.automatic`.
+    @StateObject private var startingLocation = StartingLocationRequester()
+
     var body: some View {
         // Kept deliberately small — SwiftUI's type-checker won't tolerate
         // the full chain of toolbar / sheet / 4 onChange / onReceive /
@@ -51,11 +59,17 @@ struct MacGuardianDashboardView: View {
         // `DashboardDeletionUI`.
         splitView
             .toolbar { toolbarContent }
+            // Balloon overlay for motion alerts the Guardian's audio
+            // channel probably won't carry (system muted / low volume
+            // / no output route). Displays a top-right staggered
+            // stack; hidden when audio is fine.
+            .overlay(alignment: .topTrailing) { GuardianBalloonOverlay() }
             .sheet(isPresented: $showSettings) {
                 MacSettingsSheet()
                     .frame(minWidth: 540, minHeight: 480)
             }
             .task { await guardianSync.ensureSubscription() }
+            .onAppear { startingLocation.request() }
             .modifier(DashboardLifecycle(
                 viewMode: viewMode,
                 selectedDate: selectedDate,
@@ -191,11 +205,20 @@ struct MacGuardianDashboardView: View {
     }
 
     private func deviceRow(_ p: MinorProfile) -> some View {
-        HStack(spacing: 8) {
+        let fixInfo = latestFixInfo(of: p)
+        let ts = fixInfo.timestamp
+        let motionStatus = GuardianAudioAlertService.motionStatus(
+            lastFixAt: ts, latestSpeedMS: fixInfo.speedMS
+        )
+        return HStack(spacing: 8) {
             Circle()
                 .fill(color(for: p))
                 .frame(width: 12, height: 12)
                 .overlay(Circle().strokeBorder(.white.opacity(0.6), lineWidth: 1))
+            // Three-state motion indicator — moving (bright pulse),
+            // stationary attached (dim solid), offline (grey).
+            OnlineIndicatorDot(status: motionStatus, diameter: 8)
+                .help(motionHelpText(motionStatus))
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 4) {
                     Text(p.displayName ?? "Unknown")
@@ -208,7 +231,7 @@ struct MacGuardianDashboardView: View {
                             .help("Awaiting consent")
                     }
                 }
-                if let ts = lastTimestamp(of: p) {
+                if let ts {
                     Text("Last fix \(ts, style: .relative) ago")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -241,10 +264,20 @@ struct MacGuardianDashboardView: View {
                     liveMode: viewMode == .live,
                     snapToRoads: snapService.isEnabled,
                     colors: colorMap,
-                    mapSelection: $mapSelection
+                    mapSelection: $mapSelection,
+                    fallbackCenter: startingLocation.coordinate
                 )
                 .overlay(alignment: .top) {
-                    ConsentBanner(profiles: pendingConsentProfiles)
+                    VStack(spacing: 4) {
+                        ConsentBanner(profiles: pendingConsentProfiles)
+                        // Siri hint chip — matches iOS/tvOS Guardian
+                        // surfaces. Sits over the top of the map so
+                        // it doesn't shrink the map's own frame.
+                        MapMeSiriTip(
+                            intent: WhereIsIntent(),
+                            storageKey: "MapMe.siriTip.macGuardian"
+                        )
+                    }
                 }
             }
         }
@@ -276,16 +309,34 @@ struct MacGuardianDashboardView: View {
             MapMeBrandImage()
                 .frame(height: 24)
         }
-        ToolbarItemGroup(placement: .principal) {
-            Picker("View mode", selection: $viewMode) {
-                ForEach(DashboardViewMode.allCases, id: \.self) { mode in
-                    Label(mode.label, systemImage: mode.icon).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-            .help("Switch between a single day, a 7-day window, or live tracking")
-        }
+        // View-mode buttons live in .primaryAction so a narrow
+        // window can't collapse them into the toolbar overflow
+        // chevron. Each mode is a bordered button that visibly
+        // highlights when active (tint on the icon + label).
+        // Was a segmented picker in .principal — user reported not
+        // seeing Live because the picker was hidden by macOS's
+        // aggressive toolbar collapsing on smaller windows.
         ToolbarItemGroup(placement: .primaryAction) {
+            ForEach(DashboardViewMode.allCases, id: \.self) { mode in
+                Button {
+                    viewMode = mode
+                } label: {
+                    // `.labelStyle(.titleAndIcon)` forces the label
+                    // text (Day / Week / Live) to render next to the
+                    // icon. Without it, macOS toolbar buttons render
+                    // icon-only by default and the three modes look
+                    // like unlabeled icons — user reported "can't
+                    // tell which is Live" as a result.
+                    Label(mode.label, systemImage: mode.icon)
+                        .labelStyle(.titleAndIcon)
+                        .foregroundStyle(viewMode == mode ? Color.accentColor : .primary)
+                        .fontWeight(viewMode == mode ? .semibold : .regular)
+                }
+                .help(modeHelpText(mode))
+            }
+
+            Divider()
+
             Button {
                 selectedDate = Calendar.current.startOfDay(for: Date())
             } label: {
@@ -372,6 +423,41 @@ struct MacGuardianDashboardView: View {
     }
 
     private func lastTimestamp(of p: MinorProfile) -> Date? {
+        latestFixInfo(of: p).timestamp
+    }
+
+    private func motionHelpText(_ status: DeviceMotionStatus) -> String {
+        switch status {
+        case .moving:     return "Device attached — moving"
+        case .stationary: return "Device attached — stationary"
+        case .offline:    return "Not attached recently"
+        }
+    }
+
+    private func modeHelpText(_ mode: DashboardViewMode) -> String {
+        switch mode {
+        case .day:  return "Show one calendar day's fixes"
+        case .week: return "Show the last 7 days"
+        case .live: return "Live — rolling 24 h window, pulsing marker on latest fix"
+        }
+    }
+
+    /// Newest fix's timestamp + raw speed (m/s). Used by the
+    /// sidebar row's three-state online indicator.
+    private func latestFixInfo(of p: MinorProfile) -> (timestamp: Date?, speedMS: Double?) {
+        guard let ctx = p.managedObjectContext else { return (nil, nil) }
+        let request = NSFetchRequest<LocationRecord>(entityName: "LocationRecord")
+        request.predicate = NSPredicate(format: "profile == %@", p)
+        request.sortDescriptors = [NSSortDescriptor(key: "timestamp", ascending: false)]
+        request.fetchLimit = 1
+        guard let rec = try? ctx.fetch(request).first else { return (nil, nil) }
+        return (rec.timestamp, rec.speed)
+    }
+
+    private func lastTimestampFallback(of p: MinorProfile) -> Date? {
+        // Legacy shim — the old code path materialised the full
+        // records set. Kept in case a managedObjectContext ever
+        // comes back nil.
         let set = (p.records as? Set<LocationRecord>) ?? []
         return set.compactMap(\.timestamp).max()
     }

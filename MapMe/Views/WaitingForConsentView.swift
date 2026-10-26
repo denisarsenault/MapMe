@@ -35,5 +35,6 @@ struct WaitingForConsentView: View {
         .padding()
         .frame(maxWidth: 480)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+        .overlay(alignment: .bottom) { CopyrightFooter() }
     }
 }

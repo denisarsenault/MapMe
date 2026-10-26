@@ -52,6 +52,15 @@ struct SplashView: View {
                     .foregroundStyle(.white)
                     .opacity(revealed ? 1 : 0)
             }
+
+            // Copyright pinned to the bottom of the dark navy fill.
+            // `forceLight` keeps the caption legible without picking
+            // up a light background from an inverted colour scheme.
+            VStack {
+                Spacer()
+                CopyrightFooter(style: .forceLight)
+                    .opacity(revealed ? 1 : 0)
+            }
         }
         .onAppear {
             withAnimation(.spring(response: 0.55, dampingFraction: 0.7)) {

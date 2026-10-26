@@ -16,6 +16,14 @@ import UIKit
 
 @MainActor
 final class LocationService: NSObject, ObservableObject {
+    /// Process-wide singleton so Siri AppIntents (which run in a
+    /// short-lived background context and can't reach the SwiftUI
+    /// @StateObject held by MapMeApp) can drive tracking too. The
+    /// app root uses this same instance via
+    /// `@StateObject private var location = LocationService.shared`
+    /// so views observe the same object the intent path mutates.
+    static let shared = LocationService()
+
     @Published var authorizationStatus: CLAuthorizationStatus = .notDetermined
     @Published var lastLocation: CLLocation?
     @Published var isTracking: Bool = false
@@ -48,6 +56,73 @@ final class LocationService: NSObject, ObservableObject {
     /// stationary-cluster suppressor. Capped at
     /// `stationaryClusterWindow` — appending pops the oldest.
     private var recentAcceptedFixes: [CLLocation] = []
+
+    // MARK: - Batched writes
+    //
+    // Every accepted fix used to be its own `ctx.save()`, which under
+    // `NSPersistentCloudKitContainer` triggered a fresh CloudKit export
+    // op per save. Under continuous tracking (30 s cadence at
+    // HighAccuracy) that produced enough export ops per minute to
+    // overwhelm the CloudKit scheduler — the console filled with
+    // "updateTaskRequest called for an already running/updated task"
+    // warnings, exports queued faster than they could drain, and
+    // eventually iOS jetsammed the app in the background as a
+    // misbehaving process. Guardian devices then saw no new records
+    // for hours.
+    //
+    // Batching collapses N accepted fixes into ONE save, which is ONE
+    // CloudKit export op. At `writeBatchSize = 3` that's 3× less
+    // scheduler pressure; combined with `Balanced`'s 90 s cadence
+    // gate the sync queue drains comfortably.
+    //
+    // The buffer is also flushed on `willResignActive`, `stopTracking`,
+    // and every `flushIntervalSeconds` so the worst-case data loss
+    // if the app crashes between flushes is one batch (~90–270 s
+    // depending on cadence) rather than an unbounded queue.
+    private struct PendingWrite {
+        let timestamp: Date
+        let latitude: Double
+        let longitude: Double
+        let altitude: Double
+        let speed: Double
+        let course: Double
+        let horizontalAccuracy: Double
+        let verticalAccuracy: Double
+        let deviceName: String
+        let deviceId: String
+    }
+    private var pendingWrites: [PendingWrite] = []
+    private static let writeBatchSize: Int = 3
+    private static let flushIntervalSeconds: TimeInterval = 300
+    private var flushTimer: Timer?
+
+    // MARK: - Stationary heartbeat
+    //
+    // Guardian dashboards mark a device "offline" (grey dot) if no
+    // fresh fix has arrived within `GuardianAudioAlertService`'s
+    // 30-min freshness window. A device that's genuinely stationary
+    // stops writing new fixes — the cluster + jitter filters
+    // deliberately reject repeated fixes at the same spot, since
+    // recording them adds no map information. That combination
+    // meant "parked at desk for 45 min" read the same as
+    // "vanished off the network" to the Guardian.
+    //
+    // Fix: while `isTracking` is true, a low-frequency timer emits
+    // a fresh record every `heartbeatIntervalSeconds` using the
+    // last-known coordinate, bypassing the location-quality
+    // filters. Guardian's `lastFixAt` stays inside the online
+    // window; the dot stays green as long as the device is truly
+    // running. On watchOS the same pattern lives in
+    // `WatchLocationService`.
+    private static let heartbeatIntervalSeconds: TimeInterval = 15 * 60
+    private var heartbeatTimer: Timer?
+
+    /// Rate-limit on motion-triggered immediate flush. See watch
+    /// twin for the rationale — unbounded per-fix flushing tripped
+    /// `BGSystemTaskSchedulerErrorDomain Code=3`. 15 s spacing
+    /// keeps CloudKit export ops around ~4/min at most.
+    private static let motionFlushMinSpacing: TimeInterval = 15
+    private var lastMotionFlushAt: Date?
 
     // MARK: - Fix-quality guards
     //
@@ -178,6 +253,22 @@ final class LocationService: NSObject, ObservableObject {
         refreshConsentAndApply()
 
         #if os(iOS)
+        // Drain the pending-write buffer when the app is about to
+        // resign active — user is backgrounding, locking the phone,
+        // or an interruption is coming (call, alarm). Without this,
+        // fixes we accepted just before the transition would sit in
+        // memory until the next batch trigger and could be lost if
+        // iOS suspends + terminates before the batch fills.
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.flushPendingWrites() }
+        }
+        #endif
+
+        #if os(iOS)
         // Motion watchdog: if tracking was ever stopped (backgrounded
         // over the OS suspend threshold, a subsystem crash, user
         // manually stopped from the widget) but the user then starts
@@ -267,6 +358,20 @@ final class LocationService: NSObject, ObservableObject {
         default:
             return
         }
+
+        // Ensure this device has a MinorProfile so its records have
+        // a parent to attach to. Without this, `persist()` writes
+        // records with `record.profile = nil`, they sit in the
+        // private store detached from any CKShare hierarchy, and
+        // the device never appears in Guardian's family list —
+        // even though tracking is technically running. Mac users
+        // hit this most because they typically click Start Tracking
+        // without ever going through the Invite Guardian flow that
+        // used to be the only path to `ensureMinorProfile()`.
+        // Idempotent: no-op when a profile already exists for this
+        // device's `deviceIdentifier`.
+        _ = SharingService(persistence: persistence).ensureMinorProfile()
+
         // Block tracking until a paired Guardian has written consent.
         if profileExists(), !isConsentGranted() {
             consentRequired = true
@@ -290,6 +395,10 @@ final class LocationService: NSObject, ObservableObject {
         #endif
         isTracking = true
         trackingError = nil
+        armHeartbeatTimer()
+        #if os(iOS)
+        LaunchReminderService.setTrackingActive(true)
+        #endif
     }
 
     func stopTracking() {
@@ -299,6 +408,14 @@ final class LocationService: NSObject, ObservableObject {
         manager.stopMonitoringVisits()
         #endif
         isTracking = false
+        #if os(iOS)
+        LaunchReminderService.setTrackingActive(false)
+        #endif
+        cancelHeartbeatTimer()
+        // Drain anything still buffered so a stop-and-relaunch
+        // cycle doesn't lose the tail of the previous session.
+        flushPendingWrites()
+        cancelFlushTimer()
     }
 
     private func persist(_ location: CLLocation) {
@@ -422,18 +539,64 @@ final class LocationService: NSObject, ObservableObject {
         lastAcceptedLocation = location
         appendToClusterWindow(location)
 
-        let deviceName = currentDeviceName()
-        let deviceId = currentDeviceIdentifier()
+        // Buffer instead of writing immediately. See the PendingWrite
+        // block near the top of this file for the CloudKit-scheduler
+        // rationale. Real save happens in `flushPendingWrites()` when
+        // the buffer hits `writeBatchSize`, the periodic timer fires,
+        // the app resigns active, or tracking stops.
+        pendingWrites.append(PendingWrite(
+            timestamp: location.timestamp,
+            latitude: location.coordinate.latitude,
+            longitude: location.coordinate.longitude,
+            altitude: location.altitude,
+            speed: location.speed,
+            course: location.course,
+            horizontalAccuracy: location.horizontalAccuracy,
+            verticalAccuracy: location.verticalAccuracy,
+            deviceName: currentDeviceName(),
+            deviceId: currentDeviceIdentifier()
+        ))
+        armFlushTimer()
+        // Motion-triggered immediate flush, rate-limited. Every
+        // moving fix used to flush right away and overwhelmed the
+        // BGTaskScheduler quota; 15 s spacing keeps CloudKit
+        // export ops manageable while preserving seconds-latency
+        // Live updates for the Guardian.
+        if speedKmh > Self.stationarySpeedKmh {
+            let now = Date()
+            let elapsed = lastMotionFlushAt.map { now.timeIntervalSince($0) } ?? .infinity
+            if elapsed >= Self.motionFlushMinSpacing {
+                lastMotionFlushAt = now
+                flushPendingWrites()
+            } else if pendingWrites.count >= Self.writeBatchSize {
+                flushPendingWrites()
+            }
+        } else if pendingWrites.count >= Self.writeBatchSize {
+            flushPendingWrites()
+        }
+    }
+
+    // MARK: - Batched write flush
+
+    /// Drains `pendingWrites` into a single Core Data save. Callers:
+    ///
+    /// - `persist()` when the buffer hits `writeBatchSize`
+    /// - The periodic `flushTimer` (see `armFlushTimer()`)
+    /// - `willResignActive` — user backgrounds the app / locks phone
+    /// - `stopTracking()` — no more fixes coming, drain what's queued
+    ///
+    /// The profile fetch is done ONCE per flush (previously once per
+    /// fix), and all records ride the same `ctx.save()`, so
+    /// CloudKit's export queue sees one op per batch instead of one
+    /// per fix.
+    private func flushPendingWrites() {
+        guard !pendingWrites.isEmpty else { return }
+        let batch = pendingWrites
+        pendingWrites.removeAll()
 
         let ctx = writeContext
         let privateStore = persistence.privateStore
         ctx.perform {
-            // Scope to the private store so we don't accidentally pull a
-            // mirrored MinorProfile from the shared store of a Guardian-side
-            // accepted share — that would trigger a cross-store relationship
-            // on save. Also filter by THIS device's identifier so the iPhone
-            // doesn't end up writing its records into the watch's profile
-            // (or vice versa) once both devices have created their own.
             let profileRequest = NSFetchRequest<MinorProfile>(entityName: "MinorProfile")
             profileRequest.predicate = NSPredicate(
                 format: "deviceIdentifier == %@", DeviceID.current
@@ -445,39 +608,105 @@ final class LocationService: NSObject, ObservableObject {
                 return
             }
 
-            let record = LocationRecord(context: ctx)
-            // Pin the new record to the private store before any relationship
-            // assignment — otherwise CoreData may place it in the shared
-            // store and the save will fail with NSCocoaError 134020.
-            if let privateStore {
-                ctx.assign(record, to: privateStore)
-            }
-            record.id = UUID()
-            record.timestamp = location.timestamp
-            record.latitude = location.coordinate.latitude
-            record.longitude = location.coordinate.longitude
-            record.altitude = location.altitude
-            record.speed = location.speed
-            record.course = location.course
-            record.horizontalAccuracy = location.horizontalAccuracy
-            record.verticalAccuracy = location.verticalAccuracy
-            record.deviceName = deviceName
-            record.deviceIdentifier = deviceId
-
-            // Link to the MinorProfile so the record rides the same share
-            // into the Guardian's shared CloudKit zone.
-            if let profile {
-                record.profile = profile
+            for draft in batch {
+                let record = LocationRecord(context: ctx)
+                if let privateStore {
+                    ctx.assign(record, to: privateStore)
+                }
+                record.id = UUID()
+                record.timestamp = draft.timestamp
+                record.latitude = draft.latitude
+                record.longitude = draft.longitude
+                record.altitude = draft.altitude
+                record.speed = draft.speed
+                record.course = draft.course
+                record.horizontalAccuracy = draft.horizontalAccuracy
+                record.verticalAccuracy = draft.verticalAccuracy
+                record.deviceName = draft.deviceName
+                record.deviceIdentifier = draft.deviceId
+                if let profile {
+                    record.profile = profile
+                }
             }
 
             do {
                 try ctx.save()
             } catch {
                 #if DEBUG
-                print("LocationService persist failed: \(error)")
+                print("LocationService flush failed: \(error)")
                 #endif
             }
         }
+    }
+
+    /// Schedules a periodic timer to drain the buffer even if fixes
+    /// stop coming (e.g. device sits idle just under `writeBatchSize`
+    /// pending writes). Idempotent — same-thread callers can invoke
+    /// repeatedly without stacking timers.
+    private func armFlushTimer() {
+        guard flushTimer == nil else { return }
+        flushTimer = Timer.scheduledTimer(withTimeInterval: Self.flushIntervalSeconds,
+                                          repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.flushPendingWrites()
+            }
+        }
+    }
+
+    private func cancelFlushTimer() {
+        flushTimer?.invalidate()
+        flushTimer = nil
+    }
+
+    // MARK: - Heartbeat
+
+    private func armHeartbeatTimer() {
+        guard heartbeatTimer == nil else { return }
+        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: Self.heartbeatIntervalSeconds,
+                                              repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.writeHeartbeatIfIdle()
+            }
+        }
+    }
+
+    private func cancelHeartbeatTimer() {
+        heartbeatTimer?.invalidate()
+        heartbeatTimer = nil
+    }
+
+    /// Emits a synthetic record at the last-known coordinate,
+    /// bypassing the quality / jitter / cluster filters that
+    /// would otherwise reject repeated stationary fixes. Refreshes
+    /// `lastWriteAt` and flushes any pending buffer so the
+    /// Guardian's freshness clock resets.
+    ///
+    /// Skipped when:
+    /// - tracking isn't running (nothing to heartbeat about)
+    /// - we've never accepted a fix (no coordinate to write)
+    /// - a real fix was written within the heartbeat interval
+    ///   already (the batch flush covers us)
+    private func writeHeartbeatIfIdle() {
+        guard isTracking else { return }
+        guard let last = lastAcceptedLocation else { return }
+        if let lw = lastWriteAt,
+           Date().timeIntervalSince(lw) < Self.heartbeatIntervalSeconds {
+            return
+        }
+        pendingWrites.append(PendingWrite(
+            timestamp: Date(),
+            latitude: last.coordinate.latitude,
+            longitude: last.coordinate.longitude,
+            altitude: last.altitude,
+            speed: 0,
+            course: -1,
+            horizontalAccuracy: last.horizontalAccuracy,
+            verticalAccuracy: last.verticalAccuracy,
+            deviceName: currentDeviceName(),
+            deviceId: currentDeviceIdentifier()
+        ))
+        lastWriteAt = Date()
+        flushPendingWrites()
     }
 
     private func fetchProfile() -> MinorProfile? {

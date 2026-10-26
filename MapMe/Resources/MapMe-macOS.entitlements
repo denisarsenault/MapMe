@@ -12,5 +12,13 @@
 	<array>
 		<string>CloudKit</string>
 	</array>
+	<!--
+		App Sandbox permission for Core Location. Without this the Mac
+		target's `CLLocationManager` silently refuses to deliver fixes
+		under hardened runtime — the process runs, `startUpdatingLocation`
+		returns, no `didUpdateLocations` callback ever fires.
+	-->
+	<key>com.apple.security.personal-information.location</key>
+	<true/>
 </dict>
 </plist>

@@ -182,4 +182,56 @@ final class PersistenceController: ObservableObject {
             }
         }
     }
+
+    // MARK: - Guardian sync reset (user-facing "last resort" action)
+
+    /// Wipes cached `LocationRecord` + `DayArchive` rows in both the
+    /// private and shared stores, then truncates the persistent
+    /// history table. Preserves `MinorProfile` entries so pairings
+    /// (CKShares the Guardian has accepted) survive — nuking them
+    /// would force the user to re-invite every device from every
+    /// Minor.
+    ///
+    /// Intended for the "Reset sync cache" button in Guardian
+    /// Settings. When `NSPersistentCloudKitContainer` gets wedged
+    /// (import queue stuck, records visible in the private zone but
+    /// not the shared mirror, tokens out of sync with server state)
+    /// the safest recovery short of reinstalling is to drop the
+    /// local cache and let CloudKit re-import from the shared
+    /// zones. That happens automatically on the next sync cycle
+    /// after this method completes.
+    ///
+    /// Runs on a background context. Completion fires on the main
+    /// queue with an optional error string so the caller can show
+    /// a toast / alert.
+    func resetGuardianSharedCache(completion: @escaping (_ error: String?) -> Void) {
+        Self.log.notice("resetGuardianSharedCache: starting")
+        let ctx = newBackgroundContext()
+        ctx.perform {
+            do {
+                // Batch-delete each entity across both stores. Batch
+                // deletes bypass the managed-object cache — cheap
+                // even when there are tens of thousands of rows.
+                for name in ["LocationRecord", "DayArchive"] {
+                    let request = NSFetchRequest<NSFetchRequestResult>(entityName: name)
+                    let delete = NSBatchDeleteRequest(fetchRequest: request)
+                    delete.resultType = .resultTypeCount
+                    let result = try ctx.execute(delete) as? NSBatchDeleteResult
+                    let count = (result?.result as? Int) ?? -1
+                    Self.log.notice("resetGuardianSharedCache: batch-deleted \(count) \(name, privacy: .public) rows")
+                }
+                // Truncate persistent history so CloudKit's next sync
+                // cycle bootstraps cleanly from current store state
+                // rather than replaying stale change entries.
+                let history = NSPersistentHistoryChangeRequest.deleteHistory(before: Date.distantFuture)
+                try ctx.execute(history)
+                try ctx.save()
+                Self.log.notice("resetGuardianSharedCache: complete")
+                DispatchQueue.main.async { completion(nil) }
+            } catch {
+                Self.log.error("resetGuardianSharedCache FAILED: \(error.localizedDescription, privacy: .public)")
+                DispatchQueue.main.async { completion(error.localizedDescription) }
+            }
+        }
+    }
 }

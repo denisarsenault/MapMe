@@ -114,7 +114,12 @@ struct DayDetailView: View {
         let trips: [IdentifiedTrip] = snapService.isEnabled
             ? snapService.snappedTrips(fixes)
             : SnapToRoadsService.rawTrips(fixes)
-        let rawTrips = SnapToRoadsService.rawTrips(fixes)
+        // Only segmented when the overlay is actually drawn — see the
+        // same change in LiveMapView.
+        let rawTrips: [IdentifiedTrip] =
+            (snapService.isEnabled && snapService.showRawOverlay)
+            ? SnapToRoadsService.rawTrips(fixes)
+            : []
         let firstCoord = trips.first?.coordinates.first
         let lastCoord = trips.last?.coordinates.last
         let totalCoords = trips.reduce(0) { $0 + $1.coordinates.count }

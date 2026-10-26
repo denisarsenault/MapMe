@@ -6,6 +6,7 @@
         <attribute name="deviceIdentifier" optional="YES" attributeType="String"/>
         <attribute name="displayName" optional="YES" attributeType="String"/>
         <attribute name="id" optional="YES" attributeType="UUID" usesScalarValueType="NO"/>
+        <attribute name="kindRaw" optional="YES" attributeType="String"/>
         <relationship name="archives" optional="YES" toMany="YES" deletionRule="Cascade" destinationEntity="DayArchive" inverseName="profile" inverseEntity="DayArchive"/>
         <relationship name="records" optional="YES" toMany="YES" deletionRule="Cascade" destinationEntity="LocationRecord" inverseName="profile" inverseEntity="LocationRecord"/>
     </entity>
@@ -23,6 +24,19 @@
         <attribute name="verticalAccuracy" optional="YES" attributeType="Double" defaultValueString="0.0" usesScalarValueType="YES"/>
         <relationship name="archive" optional="YES" maxCount="1" deletionRule="Nullify" destinationEntity="DayArchive" inverseName="records" inverseEntity="DayArchive"/>
         <relationship name="profile" optional="YES" maxCount="1" deletionRule="Nullify" destinationEntity="MinorProfile" inverseName="records" inverseEntity="MinorProfile"/>
+    </entity>
+    <entity name="TrustedDevice" representedClassName="TrustedDevice" syncable="YES" codeGenerationType="class">
+        <attribute name="approvedAt" optional="YES" attributeType="Date" usesScalarValueType="NO"/>
+        <attribute name="attestKeyID" optional="YES" attributeType="String"/>
+        <attribute name="deviceIdentifier" optional="YES" attributeType="String"/>
+        <attribute name="displayName" optional="YES" attributeType="String"/>
+        <attribute name="firstSeenAt" optional="YES" attributeType="Date" usesScalarValueType="NO"/>
+        <attribute name="id" optional="YES" attributeType="UUID" usesScalarValueType="NO"/>
+        <attribute name="lastActiveAt" optional="YES" attributeType="Date" usesScalarValueType="NO"/>
+        <attribute name="model" optional="YES" attributeType="String"/>
+        <attribute name="passkeyCredentialID" optional="YES" attributeType="Binary"/>
+        <attribute name="platform" optional="YES" attributeType="String"/>
+        <attribute name="revokedAt" optional="YES" attributeType="Date" usesScalarValueType="NO"/>
     </entity>
     <entity name="DayArchive" representedClassName="DayArchive" syncable="YES" codeGenerationType="class">
         <attribute name="date" optional="YES" attributeType="Date" usesScalarValueType="NO"/>

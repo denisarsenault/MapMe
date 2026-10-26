@@ -16,6 +16,8 @@ struct FamilyDashboardView: View {
     @State private var profileToDelete: MinorProfile?
     @State private var deleteError: String?
     @State private var isDeleting = false
+    @State private var addTrackerVisible = false
+    @State private var liveMapVisible = false
 
     var body: some View {
         NavigationStack {
@@ -55,6 +57,58 @@ struct FamilyDashboardView: View {
             }
             .navigationTitle("Family")
             .mapMeBrandToolbar()
+            // Tracker creation is iOS / macOS only — the shared
+            // `AddTrackerView` (and the AppIntents-backed Shortcuts
+            // action it advertises) don't compile on tvOS. tvOS
+            // doesn't use FamilyDashboardView anyway
+            // (AppleTVGuardianDashboardView takes over there), but
+            // the file is still built into the tvOS target.
+            #if os(iOS) || os(macOS)
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        addTrackerVisible = true
+                    } label: {
+                        Label("Add pet or device", systemImage: "plus.circle")
+                            .labelStyle(.titleAndIcon)
+                    }
+                }
+                // Live map button — opens a full-screen sheet with
+                // an always-on WorldMapView(liveMode: true) showing
+                // every Guardian-visible profile. iOS-only; macOS
+                // Guardian uses `MacGuardianDashboardView` which
+                // has its own Live/Day/Week toolbar picker.
+                #if os(iOS)
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        liveMapVisible = true
+                    } label: {
+                        Label("Live", systemImage: "dot.radiowaves.right")
+                            .labelStyle(.titleAndIcon)
+                            .foregroundStyle(.green)
+                    }
+                    .disabled(profiles.isEmpty)
+                }
+                #endif
+            }
+            .sheet(isPresented: $addTrackerVisible) {
+                AddTrackerView()
+            }
+            #if os(iOS)
+            .sheet(isPresented: $liveMapVisible) {
+                NavigationStack {
+                    LiveAllDevicesMap()
+                        .navigationTitle("Live · last 24 h")
+                        .navigationBarTitleDisplayMode(.inline)
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("Done") { liveMapVisible = false }
+                            }
+                        }
+                }
+            }
+            #endif
+            #endif
             .navigationDestination(for: NSManagedObjectID.self) { id in
                 MinorDetailView(profileID: id)
             }
@@ -67,6 +121,10 @@ struct FamilyDashboardView: View {
             }
             .frame(maxWidth: 720)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+            // Balloon overlay for motion alerts the Guardian's audio
+            // channel probably won't carry (system muted / low volume).
+            // See `GuardianBalloonOverlay` for the conditional logic.
+            .overlay(alignment: .topTrailing) { GuardianBalloonOverlay() }
             .confirmationDialog(
                 "Remove this device?",
                 isPresented: Binding(
@@ -122,8 +180,16 @@ struct FamilyDashboardView: View {
     }
 
     private func row(for p: MinorProfile) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
+        let fixInfo = latestFixInfo(of: p)
+        let timestamp = fixInfo.timestamp
+        let motionStatus = GuardianAudioAlertService.motionStatus(
+            lastFixAt: timestamp, latestSpeedMS: fixInfo.speedMS
+        )
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                // Three-state motion dot — bright pulsing = moving,
+                // dim solid = stationary attached, grey = offline.
+                OnlineIndicatorDot(status: motionStatus, diameter: 10)
                 Text(p.displayName ?? "Unknown").font(.headline)
                 if p.consentGrantedAt == nil {
                     Text("Needs approval")
@@ -133,7 +199,7 @@ struct FamilyDashboardView: View {
                         .foregroundStyle(.orange)
                 }
             }
-            if let timestamp = lastTimestamp(of: p) {
+            if let timestamp {
                 HStack(spacing: 8) {
                     Image(systemName: "clock")
                     Text(timestamp, style: .relative)
@@ -154,12 +220,24 @@ struct FamilyDashboardView: View {
         .padding(.vertical, 2)
     }
 
-    /// The most recent valid timestamp across this profile's records. We
-    /// can't fall back to `.distantPast` for the display string — relative
-    /// formatting on a year-1 AD date renders as "2025 yrs ago".
+    /// Newest fix timestamp for `p`. Bounded fetch — was materialising
+    /// the full `records` set via `records as? Set` which, on profiles
+    /// with tens of thousands of fixes under Live tracking, OOM'd the
+    /// app. Same pattern used across the other Guardian dashboards.
     private func lastTimestamp(of p: MinorProfile) -> Date? {
-        let set = (p.records as? Set<LocationRecord>) ?? []
-        return set.compactMap(\.timestamp).max()
+        latestFixInfo(of: p).timestamp
+    }
+
+    /// Newest fix's timestamp + raw speed (m/s) for the three-state
+    /// motion indicator. Same bounded fetchLimit=1 pattern.
+    private func latestFixInfo(of p: MinorProfile) -> (timestamp: Date?, speedMS: Double?) {
+        guard let ctx = p.managedObjectContext else { return (nil, nil) }
+        let request = NSFetchRequest<LocationRecord>(entityName: "LocationRecord")
+        request.predicate = NSPredicate(format: "profile == %@", p)
+        request.sortDescriptors = [NSSortDescriptor(key: "timestamp", ascending: false)]
+        request.fetchLimit = 1
+        guard let rec = try? ctx.fetch(request).first else { return (nil, nil) }
+        return (rec.timestamp, rec.speed)
     }
 }
 
@@ -451,7 +529,161 @@ private struct MinorDetailContent: View {
     #endif
 
     private func sortedRecords(of profile: MinorProfile) -> [LocationRecord] {
-        let set = (profile.records as? Set<LocationRecord>) ?? []
-        return set.sorted { ($0.timestamp ?? .distantPast) < ($1.timestamp ?? .distantPast) }
+        // Fetch the most-recent 500 rather than materialising every
+        // record via `profile.records as? Set<LocationRecord>`. Under
+        // Live tracking a profile can have tens of thousands of rows;
+        // returning all of them to sort in memory crashed OOM on the
+        // Minor iPhone. 500 is enough for the "Recent points" list
+        // (shown as `.suffix(50)`) plus the map polyline (`.suffix(200)`).
+        guard let ctx = profile.managedObjectContext else { return [] }
+        let request = NSFetchRequest<LocationRecord>(entityName: "LocationRecord")
+        request.predicate = NSPredicate(format: "profile == %@", profile)
+        request.sortDescriptors = [NSSortDescriptor(key: "timestamp", ascending: false)]
+        request.fetchLimit = 500
+        let recent = (try? ctx.fetch(request)) ?? []
+        // Reverse so the caller (which expects ASCENDING by time) gets
+        // the same shape as before.
+        return recent.reversed()
     }
 }
+
+#if os(iOS)
+/// Full-screen Live map sheet shown when the Guardian iPhone taps
+/// the "Live" toolbar button. Wraps `WorldMapView(liveMode: true)`
+/// so all paired Minors render with pulsing markers + the new
+/// tween animator drawing them across the map as fresh fixes
+/// arrive. Same rolling 24 h window the iPad Live toggle uses.
+///
+/// Includes a horizontal chip row (All devices + one chip per
+/// profile) that mirrors the tvOS filter UX — tapping a device
+/// chip filters the map to that device; tapping All devices
+/// resets to showing everyone. Chip selection tracks the map's
+/// tap-to-select binding so tapping a marker highlights the
+/// matching chip.
+private struct LiveAllDevicesMap: View {
+    @FetchRequest(
+        sortDescriptors: [NSSortDescriptor(key: "displayName", ascending: true)],
+        animation: .default
+    ) private var profiles: FetchedResults<MinorProfile>
+    @ObservedObject private var snapService = SnapToRoadsService.shared
+    @State private var mapSelection: NSManagedObjectID?
+    @State private var selectedProfileIDs: Set<NSManagedObjectID> = []
+
+    var body: some View {
+        VStack(spacing: 0) {
+            chipRow
+                .background(.thinMaterial)
+            WorldMapView(
+                archiveID: nil,
+                profiles: visibleProfiles,
+                dateRange: liveWindow,
+                timeCutoff: nil,
+                liveMode: true,
+                snapToRoads: snapService.isEnabled,
+                colors: colorMap,
+                mapSelection: $mapSelection
+            )
+        }
+        .ignoresSafeArea(edges: .bottom)
+        .onChange(of: mapSelection) { _, newValue in
+            // Tapping a marker on the map selects that profile in
+            // the chip row too, so the two stay in sync.
+            if let id = newValue {
+                selectedProfileIDs = [id]
+            }
+        }
+    }
+
+    private var chipRow: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                allDevicesChip
+                ForEach(profiles, id: \.objectID) { profile in
+                    deviceChip(for: profile)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+        }
+    }
+
+    private var allDevicesChip: some View {
+        let isAll = selectedProfileIDs.isEmpty
+        return Button {
+            selectedProfileIDs.removeAll()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "person.2.fill")
+                Text("All devices")
+            }
+            .font(.footnote.weight(.semibold))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(isAll ? Color.accentColor.opacity(0.20) : Color(.secondarySystemBackground),
+                        in: Capsule())
+            .overlay(
+                Capsule().stroke(isAll ? Color.accentColor : Color.gray.opacity(0.35),
+                                 lineWidth: 1)
+            )
+            .foregroundStyle(isAll ? Color.accentColor : .primary)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func deviceChip(for profile: MinorProfile) -> some View {
+        let isSelected = selectedProfileIDs.contains(profile.objectID)
+        let color = colorMap[profile.objectID] ?? .gray
+        return Button {
+            if isSelected {
+                selectedProfileIDs.remove(profile.objectID)
+            } else {
+                // Single-select on tap. Matches the "tap chip to
+                // focus one device" feel; combos are still possible
+                // via long-press if we add it later.
+                selectedProfileIDs = [profile.objectID]
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Circle()
+                    .fill(color)
+                    .frame(width: 8, height: 8)
+                Text(profile.displayName ?? "Device")
+                    .lineLimit(1)
+            }
+            .font(.footnote.weight(.semibold))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(isSelected ? color.opacity(0.18) : Color(.secondarySystemBackground),
+                        in: Capsule())
+            .overlay(
+                Capsule().stroke(isSelected ? color : Color.gray.opacity(0.35),
+                                 lineWidth: 1)
+            )
+            .foregroundStyle(.primary)
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Empty selection = show every paired profile. Any non-empty
+    /// selection filters down to just those.
+    private var visibleProfiles: [MinorProfile] {
+        if selectedProfileIDs.isEmpty { return Array(profiles) }
+        return profiles.filter { selectedProfileIDs.contains($0.objectID) }
+    }
+
+    private var liveWindow: ClosedRange<Date> {
+        let now = Date()
+        return now.addingTimeInterval(-24 * 3600) ... now
+    }
+
+    private var colorMap: [NSManagedObjectID: Color] {
+        let palette: [Color] = [
+            .blue, .green, .red, .orange, .purple,
+            .pink, .cyan, .mint, .indigo, .teal, .yellow
+        ]
+        return Dictionary(uniqueKeysWithValues: profiles.enumerated().map {
+            ($0.element.objectID, palette[$0.offset % palette.count])
+        })
+    }
+}
+#endif

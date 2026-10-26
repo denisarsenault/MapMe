@@ -71,6 +71,24 @@ struct AppleTVGuardianDashboardView: View {
     /// This adds a Settings button in the top bar's second row that
     /// presents `SettingsView` as a full-screen sheet.
     @State private var settingsVisible: Bool = false
+
+    // MARK: - Screensaver
+
+    /// `true` after `screensaverIdleThreshold` of no Siri Remote
+    /// input. Puts a full-screen dark overlay with the drifting
+    /// `MMLogo` on top of the dashboard so the OLED / plasma pixels
+    /// underneath don't burn in after hours of a mostly-static map.
+    /// Dismissed by ANY remote input.
+    @State private var screensaverActive: Bool = false
+    /// Wall clock of the most recent Siri Remote input. Reset by
+    /// `onMoveCommand` / `onPlayPauseCommand` / `onExitCommand` and
+    /// any tap-focused button click.
+    @State private var lastActivityAt: Date = Date()
+    /// How long the dashboard has to sit un-touched before the
+    /// custom screensaver kicks in. 5 min is short enough to catch
+    /// "user walked away" but long enough that a Guardian glancing
+    /// at the room doesn't have to keep the remote in their hand.
+    private static let screensaverIdleThreshold: TimeInterval = 5 * 60
     /// Map base style picker. `WorldMapView` applies the matching
     /// `MapKit.MapStyle`. tvOS has no built-in style switcher, so
     /// we surface Standard / Satellite / Hybrid as top-bar buttons.
@@ -82,12 +100,22 @@ struct AppleTVGuardianDashboardView: View {
     /// `MapCameraPosition` span accordingly.
     @State private var zoomInPulse: Int = 0
     @State private var zoomOutPulse: Int = 0
+    /// Zoom-by-drag mode. Toggled by the Zoom button in the top bar.
+    /// While on, a transparent overlay captures the Siri Remote's
+    /// touch-surface drag; vertical translation drives zoom instead
+    /// of pan. Menu / Play-Pause / the on-screen Done button all
+    /// exit the mode.
+    @State private var zoomInteractive: Bool = false
+    /// Restores focus onto the Zoom button after the zoom mode exits.
+    @FocusState private var zoomMapButtonFocused: Bool
     @ObservedObject private var snapService = SnapToRoadsService.shared
 
     var body: some View {
         ZStack(alignment: .top) {
             mapLayer
-            if !mapInteractive {
+            if zoomInteractive {
+                zoomDragOverlay
+            } else if !mapInteractive {
                 chromeLayer
             } else {
                 exitMapOverlay
@@ -96,21 +124,54 @@ struct AppleTVGuardianDashboardView: View {
                 helpOverlay
                     .transition(.opacity.combined(with: .scale(scale: 0.96)))
             }
+            if screensaverActive {
+                MapMeScreensaverView()
+                    .transition(.opacity)
+                    .zIndex(100)
+            }
+            // Balloon overlay for motion alerts the Guardian's HDMI
+            // receiver probably isn't playing (silent / off between
+            // handshakes). Sits above the screensaver so an alert
+            // that lands while the TV's asleep is still readable if
+            // the panel lights back up.
+            GuardianBalloonOverlay()
+                .zIndex(200)
         }
         .animation(.easeInOut(duration: 0.2), value: helpVisible)
+        .animation(.easeInOut(duration: 0.6), value: screensaverActive)
         .onAppear {
             // Seed the help sheet on first launch only. After the
             // user taps Got it, `helpDismissed` flips and the sheet
             // stays closed across subsequent app launches.
             if !helpDismissed { helpVisible = true }
+            // Prevent tvOS from firing the system screensaver over
+            // MapMe. Without this, the OS dims + shows Apple's aerial
+            // after ~15 min, hiding whatever a Guardian left on
+            // screen. Our own custom screensaver kicks in first at
+            // `screensaverIdleThreshold` and drifts the logo so we
+            // don't burn a static map into an OLED / plasma panel.
+            UIApplication.shared.isIdleTimerDisabled = true
+        }
+        .onDisappear {
+            // Restore the system idle timer when leaving this view so
+            // MapMe never permanently blocks the system screensaver
+            // (e.g. if the user backs out to a different screen).
+            UIApplication.shared.isIdleTimerDisabled = false
         }
         .onPlayPauseCommand {
-            // Play/Pause on the Siri Remote is unused on this screen,
-            // so we repurpose it as a quick "toggle pan-mode" shortcut.
-            // Users who land on Map mode without realising it can hit
-            // Play/Pause to escape back to the focus-engine controls.
-            mapInteractive.toggle()
+            wakeFromScreensaver()
+            // Play/Pause priorities:
+            //   1. If we're in zoom mode, exit zoom (most-recent mode wins).
+            //   2. Otherwise, toggle pan mode (existing behaviour).
+            if zoomInteractive {
+                zoomInteractive = false
+            } else {
+                mapInteractive.toggle()
+            }
         }
+        // Any remote directional swipe counts as user activity —
+        // resets the idle counter and dismisses the screensaver.
+        .onMoveCommand { _ in wakeFromScreensaver() }
         // Menu/Back is the tvOS-canonical "go back / get me out" gesture.
         // Wire it as a third exit so users who don't know Play/Pause is
         // overloaded — and can't reach the Done button because the Map
@@ -119,7 +180,24 @@ struct AppleTVGuardianDashboardView: View {
         // Only intercept while we're IN pan mode; otherwise let the
         // system's default Menu behaviour (back to home screen) run.
         .onExitCommand {
-            if mapInteractive { mapInteractive = false }
+            let wasSaverActive = screensaverActive
+            wakeFromScreensaver()
+            // Menu also exits zoom mode ahead of pan mode — same
+            // "most-recent mode wins" order as onPlayPauseCommand.
+            if !wasSaverActive, zoomInteractive { zoomInteractive = false; return }
+            // If Menu just woke the screensaver, that alone was the
+            // action — don't also exit pan mode. Otherwise use Menu
+            // for its normal pan-mode-exit purpose.
+            if !wasSaverActive, mapInteractive { mapInteractive = false }
+        }
+        // Periodic idle check. Runs while the view is on screen.
+        // 30 s cadence is plenty — the announcement precision is
+        // `screensaverIdleThreshold` anyway.
+        .onReceive(Timer.publish(every: 30, on: .main, in: .common).autoconnect()) { _ in
+            let idle = Date().timeIntervalSince(lastActivityAt)
+            if !screensaverActive, idle >= Self.screensaverIdleThreshold {
+                screensaverActive = true
+            }
         }
         .task { await guardianSync.ensureSubscription() }
         .onReceive(NotificationCenter.default
@@ -153,6 +231,18 @@ struct AppleTVGuardianDashboardView: View {
             Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(80))
                 panMapButtonFocused = true
+            }
+        }
+        // Same focus-restore pattern for zoom mode exit — the
+        // chromeLayer just re-appeared under nothing focused, so the
+        // engine has no anchor to land the next Siri Remote swipe on.
+        // Point it at the Zoom button so the user can immediately
+        // re-enter zoom mode without having to hunt.
+        .onChange(of: zoomInteractive) { _, isInteractive in
+            guard !isInteractive else { return }
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(80))
+                zoomMapButtonFocused = true
             }
         }
         .sheet(isPresented: $settingsVisible) {
@@ -204,6 +294,15 @@ struct AppleTVGuardianDashboardView: View {
             if !profiles.isEmpty {
                 deviceCardRow
                     .focusSection()
+                // Siri hint chip — matches iOS/mac Guardian
+                // surfaces. `focusable(false)` (inside MapMeSiriTip
+                // for tvOS) keeps it out of the focus engine so the
+                // Siri Remote doesn't have to step past it to reach
+                // the map or the device cards.
+                MapMeSiriTip(
+                    intent: WhereIsIntent(),
+                    storageKey: "MapMe.siriTip.tvGuardian"
+                )
             }
             Spacer()
         }
@@ -255,6 +354,67 @@ struct AppleTVGuardianDashboardView: View {
                 .padding(.top, 60)
             }
             Spacer()
+        }
+    }
+
+    /// Zoom-by-drag overlay. Shown only when `zoomInteractive == true`.
+    /// A transparent full-screen view captures the Siri Remote's
+    /// touch-surface drag; vertical translation drives incremental
+    /// zoom by bumping `zoomInPulse` / `zoomOutPulse` at fixed
+    /// per-pixel intervals, so the felt zoom rate is continuous
+    /// rather than one giant snap at drag-end.
+    ///
+    /// A Done button + on-screen hints for Menu/Play-Pause exits
+    /// mirror the pan-mode escape UX so a user can't get stranded in
+    /// zoom mode.
+    private var zoomDragOverlay: some View {
+        VStack {
+            HStack {
+                Spacer()
+                VStack(alignment: .trailing, spacing: 8) {
+                    Button {
+                        zoomInteractive = false
+                    } label: {
+                        Label("Done", systemImage: "checkmark.circle.fill")
+                            .font(.title3.weight(.semibold))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.green)
+
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Label("Swipe up = zoom in", systemImage: "arrow.up")
+                        Label("Swipe down = zoom out", systemImage: "arrow.down")
+                        Label("or press Play/Pause", systemImage: "playpause.fill")
+                        Label("or press Menu / Back", systemImage: "arrow.uturn.backward")
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.85))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
+                }
+                .padding(.trailing, 60)
+                .padding(.top, 60)
+            }
+            Spacer()
+        }
+        .contentShape(Rectangle())
+        // On tvOS `DragGesture` is unavailable — the Siri Remote's
+        // touch surface only surfaces discrete swipe events via
+        // `.onMoveCommand`. Each swipe maps to a single zoom step:
+        // up = in, down = out. The user can swipe repeatedly to
+        // zoom further. Left/right swipes are ignored inside zoom
+        // mode so the user doesn't accidentally exit into the map's
+        // built-in pan focus.
+        .focusable(true)
+        .onMoveCommand { direction in
+            switch direction {
+            case .up:    zoomInPulse &+= 1
+            case .down:  zoomOutPulse &+= 1
+            default:     break
+            }
         }
     }
 
@@ -311,6 +471,7 @@ struct AppleTVGuardianDashboardView: View {
                 Spacer(minLength: 12)
                 settingsButton
                 helpButton
+                zoomMapButton
                 panMapButton
             }
             .focusSection()
@@ -420,8 +581,19 @@ struct AppleTVGuardianDashboardView: View {
                 Button {
                     selectedDate = Date()
                 } label: {
-                    Label("Today", systemImage: "calendar")
-                        .font(.callout)
+                    // Explicit HStack instead of `Label(_, systemImage:)`.
+                    // On tvOS 17+ inside a `.bordered` button the Label
+                    // renderer stacks icon-on-top-of-title vertically
+                    // when the trailing space is ambiguous — user
+                    // reported a distorted tall pill where "Today"
+                    // wrapped one character per line. Explicit HStack
+                    // + fixedSize pins the horizontal layout.
+                    HStack(spacing: 6) {
+                        Image(systemName: "calendar")
+                        Text("Today")
+                    }
+                    .font(.callout)
+                    .fixedSize()
                 }
                 .buttonStyle(.bordered)
             }
@@ -480,6 +652,23 @@ struct AppleTVGuardianDashboardView: View {
                 .font(.callout)
         }
         .buttonStyle(.bordered)
+    }
+
+    /// Zoom mode entry — hands the Siri Remote's touch surface to
+    /// the `zoomDragOverlay`, which reads drag translation and pumps
+    /// `zoomInPulse` / `zoomOutPulse`. Distinct from pan mode: pan
+    /// = move the camera, zoom = change the camera span. Only one
+    /// mode is active at a time.
+    private var zoomMapButton: some View {
+        Button {
+            zoomInteractive = true
+        } label: {
+            Label("Zoom map", systemImage: "arrow.up.and.down.and.arrow.left.and.right")
+                .font(.callout)
+                .foregroundStyle(.orange)
+        }
+        .buttonStyle(.bordered)
+        .focused($zoomMapButtonFocused)
     }
 
     /// Primary action: hands map control to the Siri Remote. Same
@@ -585,13 +774,22 @@ struct AppleTVGuardianDashboardView: View {
     private func deviceCard(for profile: MinorProfile) -> some View {
         let isSelected = selectedProfileIDs.contains(profile.objectID)
         let color = colorMap[profile.objectID] ?? .gray
-        let allRecords = (profile.records as? Set<LocationRecord>) ?? []
-        let inRange = allRecords.filter { rec in
-            guard let ts = rec.timestamp else { return false }
-            return effectiveDateRange.contains(ts)
-        }
-        let lastSeen = allRecords.compactMap(\.timestamp).max()
+        // Use targeted fetches instead of materialising the full
+        // `records` relationship — under Live tracking a profile can
+        // have tens of thousands of rows and the previous
+        // (`profile.records as? Set`) approach crashed OOM on the
+        // Guardian device just from rendering the card row.
+        let inRangeCount = fetchCount(for: profile, in: effectiveDateRange)
+        let fixInfo = fetchLatestFixInfo(for: profile)
+        let lastSeen = fixInfo.timestamp
         let needsApproval = profile.consentGrantedAt == nil
+
+        // Three-state motion status shared with every Guardian
+        // surface — moving (bright pulsing), stationary attached
+        // (dim solid), offline (grey).
+        let motionStatus = GuardianAudioAlertService.motionStatus(
+            lastFixAt: lastSeen, latestSpeedMS: fixInfo.speedMS
+        )
 
         return Button {
             if isSelected {
@@ -605,6 +803,11 @@ struct AppleTVGuardianDashboardView: View {
                     Circle()
                         .fill(color)
                         .frame(width: 12, height: 12)
+                    // Online-status indicator. Pulses lightly when
+                    // online so a Guardian glancing at the row can
+                    // tell the device is currently reporting. Grey
+                    // dot when offline.
+                    OnlineIndicatorDot(status: motionStatus)
                     if needsApproval {
                         Image(systemName: "exclamationmark.shield.fill")
                             .foregroundStyle(.orange)
@@ -641,7 +844,7 @@ struct AppleTVGuardianDashboardView: View {
                 }
                 .font(.system(size: Self.cardSubtitleSize, weight: .semibold))
 
-                Text("\(inRange.count) fix\(inRange.count == 1 ? "" : "es") in view")
+                Text("\(inRangeCount) fix\(inRangeCount == 1 ? "" : "es") in view")
                     .font(.system(size: Self.cardCaptionSize))
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
@@ -757,6 +960,53 @@ struct AppleTVGuardianDashboardView: View {
         }
     }
 
+    // MARK: - Screensaver
+
+    /// Called by every remote-input handler on this view. Resets the
+    /// idle timer and dismisses the screensaver if it's up. Whether
+    /// the caller ALSO does its own work (like toggling pan mode on
+    /// Play/Pause) is up to the caller — this is just the wake path.
+    private func wakeFromScreensaver() {
+        lastActivityAt = Date()
+        if screensaverActive {
+            screensaverActive = false
+        }
+    }
+
+    // MARK: - Store fetches (bounded — avoid materialising huge `records` sets)
+
+    /// Newest fix timestamp for `profile`. Uses a targeted fetch with
+    /// `fetchLimit: 1` instead of walking the whole `records` set.
+    private func fetchLatestTimestamp(for profile: MinorProfile) -> Date? {
+        fetchLatestFixInfo(for: profile).timestamp
+    }
+
+    /// Newest fix's timestamp + raw speed (m/s) for the three-state
+    /// online indicator. Same bounded fetch as the timestamp-only
+    /// helper — no set materialisation.
+    private func fetchLatestFixInfo(for profile: MinorProfile) -> (timestamp: Date?, speedMS: Double?) {
+        guard let ctx = profile.managedObjectContext else { return (nil, nil) }
+        let request = NSFetchRequest<LocationRecord>(entityName: "LocationRecord")
+        request.predicate = NSPredicate(format: "profile == %@", profile)
+        request.sortDescriptors = [NSSortDescriptor(key: "timestamp", ascending: false)]
+        request.fetchLimit = 1
+        guard let rec = try? ctx.fetch(request).first else { return (nil, nil) }
+        return (rec.timestamp, rec.speed)
+    }
+
+    /// Count of records for `profile` whose timestamp falls inside
+    /// `range`. Uses `NSFetchRequest.count(for:)` so no rows are
+    /// materialised — just the SQLite index answer.
+    private func fetchCount(for profile: MinorProfile, in range: ClosedRange<Date>) -> Int {
+        guard let ctx = profile.managedObjectContext else { return 0 }
+        let request = NSFetchRequest<LocationRecord>(entityName: "LocationRecord")
+        request.predicate = NSPredicate(
+            format: "profile == %@ AND timestamp >= %@ AND timestamp <= %@",
+            profile, range.lowerBound as NSDate, range.upperBound as NSDate
+        )
+        return (try? ctx.count(for: request)) ?? 0
+    }
+
     // MARK: - Derived
 
     private var visibleProfiles: [MinorProfile] {
@@ -805,6 +1055,70 @@ struct AppleTVGuardianDashboardView: View {
     }
 }
 
+// MARK: - Online-status indicator
+// Moved to `ViewModifiers.swift` so iPhone / iPad / macOS Guardian
+// surfaces can share the same visual with the same 30-min "recent
+// fix" threshold — one source of truth for "device is attached".
+
+
+// MARK: - Custom screensaver
+
+/// Full-screen dark overlay with the MapMe wordmark drifting in a
+/// slow Lissajous pattern. Two jobs:
+///
+///  1. **Idle protection**: kicks in after 5 min of no Siri Remote
+///     activity so a Guardian glancing at the TV doesn't have to hit
+///     a button every few minutes.
+///  2. **Burn-in protection**: keeps the logo moving continuously so
+///     no single pixel is on for hours. `TimelineView(.animation)`
+///     drives the movement independently of any parent re-render, so
+///     the drift is smooth even when the dashboard beneath is
+///     otherwise idle.
+///
+/// Dismissed by any remote input handler on the parent view. Marked
+/// non-focusable so the focus engine ignores it and the parent view
+/// keeps its focus context intact for when the saver dismisses.
+struct MapMeScreensaverView: View {
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+            // Two coprime frequencies for x and y produce a
+            // never-quite-repeating drift. Amplitude picked so the
+            // logo stays clear of the 1080p safe edges on typical
+            // Apple TV panels (± 480 px horizontally, ± 240 px
+            // vertically). Adjust if we ever ship 4K assets.
+            let x = CGFloat(sin(t * 0.030)) * 480
+            let y = CGFloat(cos(t * 0.019)) * 240
+            // Slow opacity breathing (0.85 → 1.0) adds a second axis
+            // of change on top of position, so any pixel the logo
+            // is currently on isn't sitting at the same luminance for
+            // more than a few seconds.
+            let opacity = 0.85 + 0.15 * (0.5 + 0.5 * sin(t * 0.11))
+
+            ZStack {
+                Color.black.ignoresSafeArea()
+                Image("MMLogo")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 520)
+                    .opacity(opacity)
+                    .offset(x: x, y: y)
+                    .accessibilityLabel("MapMe screensaver")
+
+                // Tiny hint at the bottom so someone finding a black
+                // screen with a floating logo knows how to get back.
+                VStack {
+                    Spacer()
+                    Text("Press any button to wake")
+                        .font(.caption)
+                        .foregroundStyle(Color.white.opacity(0.35))
+                        .padding(.bottom, 40)
+                }
+            }
+        }
+        .transaction { $0.animation = nil }
+    }
+}
 
 #Preview("Light Mode") {
     AppleTVGuardianDashboardView()
